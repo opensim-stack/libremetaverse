@@ -87,6 +87,7 @@ namespace LibreMetaverse
         {
             public CrossingState State;
             public DateTime StartTime;
+            public DateTime LastStateChangeTime;
             public Simulator? OldSimulator;
             public Simulator? NewSimulator;
             public ulong RegionHandle;
@@ -102,6 +103,9 @@ namespace LibreMetaverse
             public string FailureMessage = string.Empty;
             public Exception? LastException;
             public bool HasRestoredOldSim;
+            public DateTime? FirstConnectAttemptAt;
+            public DateTime? LastConnectAttemptAt;
+            public DateTime? LastConnectAttemptCompletedAt;
             // Cancelled when this crossing is superseded or the state machine should abort
             public readonly CancellationTokenSource WorkCts = new CancellationTokenSource();
         }
@@ -164,6 +168,7 @@ namespace LibreMetaverse
                 {
                     State = CrossingState.PreparingCross,
                     StartTime = Client.UtcNow,
+                    LastStateChangeTime = Client.UtcNow,
                     OldSimulator = oldSim,
                     RegionHandle = regionHandle,
                     EndPoint = endPoint,
@@ -216,8 +221,22 @@ namespace LibreMetaverse
                     return false;
                 }
 
-                Logger.Debug($"Region crossing state transition: {crossing.State} -> {newState}", Client);
+                var now = Client.UtcNow;
+                var previousState = crossing.State;
+                var previousStateDuration = now - crossing.LastStateChangeTime;
+                var totalDuration = now - crossing.StartTime;
+                Logger.Debug(
+                    $"Region crossing state transition: {previousState} -> {newState} (previousStateSeconds={previousStateDuration.TotalSeconds:F2}, totalSeconds={totalDuration.TotalSeconds:F2})",
+                    Client);
                 crossing.State = newState;
+                crossing.LastStateChangeTime = now;
+
+                if (newState == CrossingState.Connecting)
+                {
+                    Logger.Debug(
+                        $"Region crossing connecting context: endPoint={crossing.EndPoint} seedCapHost={crossing.SeedCapability?.Host ?? "null"} seedCapPath={crossing.SeedCapability?.AbsolutePath ?? "null"}",
+                        Client);
+                }
             }
             finally { _stateLock.Release(); }
 
@@ -239,7 +258,7 @@ namespace LibreMetaverse
             {
                 CrossingState.Idle             => to == CrossingState.PreparingCross,
                 CrossingState.PreparingCross   => to is CrossingState.Connecting or CrossingState.Failed,
-                CrossingState.Connecting       => to is CrossingState.WaitingForComplete or CrossingState.Failed or CrossingState.Recovering,
+                CrossingState.Connecting       => to is CrossingState.WaitingForComplete or CrossingState.Completed or CrossingState.Failed or CrossingState.Recovering,
                 CrossingState.WaitingForComplete => to is CrossingState.Completed or CrossingState.Failed or CrossingState.Connecting or CrossingState.Recovering,
                 CrossingState.Recovering       => to is CrossingState.Idle or CrossingState.Failed or CrossingState.Connecting,
                 CrossingState.Completed or CrossingState.Failed => to is CrossingState.Idle or CrossingState.PreparingCross,
@@ -251,7 +270,13 @@ namespace LibreMetaverse
         {
             while (!token.IsCancellationRequested)
             {
+                var attemptStartedAt = DateTime.UtcNow;
+                crossing.FirstConnectAttemptAt ??= attemptStartedAt;
+                crossing.LastConnectAttemptAt = attemptStartedAt;
                 Logger.Info($"Connecting to new region: {crossing.EndPoint} (attempt {crossing.RetryCount + 1}/{CrossingInfo.MaxRetries})", Client);
+                Logger.Debug(
+                    $"Crossing connect attempt timing: stateAgeSeconds={(attemptStartedAt - crossing.LastStateChangeTime).TotalSeconds:F2}, totalAgeSeconds={(attemptStartedAt - crossing.StartTime).TotalSeconds:F2}",
+                    Client);
 
                 if (crossing.EndPoint == null)
                 {
@@ -289,6 +314,8 @@ namespace LibreMetaverse
 
                 if (newSim != null)
                 {
+                    crossing.LastConnectAttemptCompletedAt = DateTime.UtcNow;
+                    var connectDuration = crossing.LastConnectAttemptCompletedAt.Value - attemptStartedAt;
                     crossing.NewSimulator = newSim;
                     relativePosition = crossing.Position;
                     LastPositionUpdate = Client!.UtcNow;
@@ -297,13 +324,27 @@ namespace LibreMetaverse
                     if (crossing.OldSimulator != null && crossing.OldSimulator != newSim)
                         crossing.OldSimulator.AgentMovementComplete = false;
 
-                    Logger.Info($"Successfully connected to new region: {newSim.Name}", Client);
+                    Logger.Info(
+                        $"Successfully connected to new region: {newSim.Name} (connectMs={connectDuration.TotalMilliseconds:F0})",
+                        Client);
+
+                    // MovementComplete can arrive before we transition into WaitingForComplete.
+                    // If the simulator already reports complete, finish crossing immediately.
+                    if (newSim.AgentMovementComplete)
+                    {
+                        Logger.Info($"New simulator {newSim.Name} is already movement-complete; completing crossing without wait", Client);
+                        return await TransitionCrossingStateAsync(CrossingState.Completed, token).ConfigureAwait(false);
+                    }
+
+                    Logger.Debug($"Waiting for MovementComplete from simulator {newSim.Name}", Client);
                     return await TransitionCrossingStateAsync(CrossingState.WaitingForComplete, token).ConfigureAwait(false);
                 }
 
+                crossing.LastConnectAttemptCompletedAt = DateTime.UtcNow;
+                var failedConnectDuration = crossing.LastConnectAttemptCompletedAt.Value - attemptStartedAt;
                 crossing.FailureReason = CrossingFailureReason.ConnectionFailed;
                 crossing.FailureMessage = $"Failed to connect to {crossing.EndPoint}";
-                Logger.Warn(crossing.FailureMessage, Client);
+                Logger.Warn($"{crossing.FailureMessage} (connectMs={failedConnectDuration.TotalMilliseconds:F0})", Client);
 
                 if (crossing.RetryCount < CrossingInfo.MaxRetries)
                 {
@@ -387,6 +428,8 @@ namespace LibreMetaverse
             if (m_RegionCrossed != null)
                 OnRegionCrossed(new RegionCrossedEventArgs(crossing.OldSimulator, crossing.NewSimulator));
 
+            crossing.WorkCts.Cancel();
+            _currentCrossing = null;
             crossing.State = CrossingState.Idle;
             Logger.Debug($"Crossing cleanup: Old sim {crossing.OldSimulator?.Name ?? "null"}, New sim {crossing.NewSimulator?.Name ?? "null"}", Client);
             return true;
@@ -420,6 +463,8 @@ namespace LibreMetaverse
             if (m_RegionCrossed != null)
                 OnRegionCrossed(new RegionCrossedEventArgs(crossing.OldSimulator, null));
 
+            crossing.WorkCts.Cancel();
+            _currentCrossing = null;
             crossing.State = CrossingState.Idle;
             return false;
         }
@@ -427,7 +472,32 @@ namespace LibreMetaverse
         private void NotifyMovementComplete(Simulator simulator)
         {
             var crossing = _currentCrossing;
-            if (crossing == null || crossing.State != CrossingState.WaitingForComplete) return;
+            if (crossing == null) return;
+
+            if (crossing.State != CrossingState.WaitingForComplete)
+            {
+                var now = Client.UtcNow;
+                var stateAge = now - crossing.LastStateChangeTime;
+
+                // Some grids can report MovementComplete before we transition to WaitingForComplete.
+                // If this arrives from the destination simulator while still Connecting, complete crossing directly.
+                if (crossing.State == CrossingState.Connecting && crossing.NewSimulator == simulator)
+                {
+                    Logger.Debug(
+                        $"MovementComplete arrived early during Connecting from destination simulator {simulator?.Name}; completing crossing (stateAgeSeconds={stateAge.TotalSeconds:F2})",
+                        Client);
+                    LogCrossingFaults(Task.Run(async () =>
+                    {
+                        await TransitionCrossingStateAsync(CrossingState.Completed, crossing.WorkCts.Token).ConfigureAwait(false);
+                    }), "movement complete (early connecting)");
+                    return;
+                }
+
+                Logger.Debug(
+                    $"MovementComplete observed while crossing state is {crossing.State} from simulator {simulator?.Name} (stateAgeSeconds={stateAge.TotalSeconds:F2})",
+                    Client);
+                return;
+            }
 
             LogCrossingFaults(Task.Run(async () =>
             {
@@ -461,7 +531,17 @@ namespace LibreMetaverse
             {
                 crossing.FailureReason = CrossingFailureReason.Timeout;
                 crossing.FailureMessage = $"Timeout in state {s}";
-                Logger.Warn($"Region crossing timed out in state {s}", Client);
+                var now = Client.UtcNow;
+                var stateAge = now - crossing.LastStateChangeTime;
+                var firstAttemptAge = crossing.FirstConnectAttemptAt.HasValue
+                    ? (now - crossing.FirstConnectAttemptAt.Value).TotalSeconds.ToString("F2")
+                    : "n/a";
+                var lastAttemptAge = crossing.LastConnectAttemptAt.HasValue
+                    ? (now - crossing.LastConnectAttemptAt.Value).TotalSeconds.ToString("F2")
+                    : "n/a";
+                Logger.Warn(
+                    $"Region crossing timed out in state {s} (stateAgeSeconds={stateAge.TotalSeconds:F2}, firstConnectAttemptAgeSeconds={firstAttemptAge}, lastConnectAttemptAgeSeconds={lastAttemptAge}, endPoint={crossing.EndPoint}, seedCapHost={crossing.SeedCapability?.Host ?? "null"})",
+                    Client);
 
                 var next = s == CrossingState.Recovering ? CrossingState.Failed : CrossingState.Recovering;
                 await TransitionCrossingStateAsync(next, crossing.WorkCts.Token).ConfigureAwait(false);

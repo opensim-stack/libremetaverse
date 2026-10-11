@@ -733,7 +733,9 @@ namespace LibreMetaverse
                 Logger.Info($"Moving to another simulator; sending CompleteAgentMovement to {simulator.Name}", Client);
                 // Move in to this simulator
                 simulator.handshakeComplete = false;
-                simulator.UseCircuitCode(true);
+                // Do not block region crossing on ACK here. Under packet loss this wait can pin
+                // the crossing state in Connecting until timeout when revisiting a known simulator.
+                simulator.UseCircuitCode(waitForAck: false);
                 Client.Self.CompleteAgentMovement(simulator);
 
                 // We're already connected to this server, but need to set it to the default
