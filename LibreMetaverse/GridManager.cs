@@ -37,116 +37,6 @@ using System.Collections.ObjectModel;
 
 namespace LibreMetaverse
 {
-    #region Enums
-
-    /// <summary>
-    /// Map layer request type
-    /// </summary>
-    public enum GridLayerType : uint
-    {
-        /// <summary>Objects and terrain are shown</summary>
-        Objects = 0,
-        /// <summary>Only the terrain is shown, no objects</summary>
-        Terrain = 1,
-        /// <summary>Overlay showing land for sale and for auction</summary>
-        LandForSale = 2
-    }
-
-    /// <summary>
-    /// Type of grid item, such as telehub, event, popular location, etc.
-    /// </summary>
-    public enum GridItemType : uint
-    {
-        /// <summary>Telehub</summary>
-        Telehub = 1,
-        /// <summary>PG rated event</summary>
-        PgEvent = 2,
-        /// <summary>Mature rated event</summary>
-        MatureEvent = 3,
-        /// <summary>Popular location</summary>
-        Popular = 4,
-        /// <summary>Locations of avatar groups in a region</summary>
-        AgentLocations = 6,
-        /// <summary>Land for sale</summary>
-        LandForSale = 7,
-        /// <summary>Classified ad</summary>
-        Classified = 8,
-        /// <summary>Adult rated event</summary>
-        AdultEvent = 9,
-        /// <summary>Adult land for sale</summary>
-        AdultLandForSale = 10
-    }
-
-    #endregion Enums
-
-    #region Structs
-
-    /// <summary>
-	/// Information about a region on the grid map
-	/// </summary>
-	public struct GridRegion
-	{
-        /// <summary>Sim X position on World Map</summary>
-		public int X;
-        /// <summary>Sim Y position on World Map</summary>
-		public int Y;
-        /// <summary>Sim Name (NOTE: In lowercase!)</summary>
-		public string Name;
-        /// <summary>Access level</summary>
-		public SimAccess Access;
-        /// <summary>Appears to always be zero (None)</summary>
-        public RegionFlags RegionFlags;
-        /// <summary>Water Height</summary>
-		public byte WaterHeight;
-        /// <summary></summary>
-		public byte Agents;
-        /// <summary>UUID of the World Map image</summary>
-		public UUID MapImageID;
-        /// <summary>Unique identifier for this region, a combination of the X 
-        /// and Y position</summary>
-		public ulong RegionHandle;
-
-
-        public override string ToString()
-        {
-            return $"{Name} ({X}/{Y}), Handle: {RegionHandle}, MapImage: {MapImageID}, Access: {Access}";
-        }
-
-        public override int GetHashCode()
-        {
-            return X.GetHashCode() ^ Y.GetHashCode();
-        }
-
-        public override bool Equals(object? obj)
-        {
-            return (obj is GridRegion region) && Equals(region);
-        }
-
-        private bool Equals(GridRegion region)
-        {
-            return this.X == region.X && this.Y == region.Y;
-        }
-	}
-
-    /// <summary>
-    /// Visual chunk of the grid map
-    /// </summary>
-    public struct GridLayer
-    {
-        public int Bottom;
-        public int Left;
-        public int Top;
-        public int Right;
-        public UUID ImageID;
-
-        public bool ContainsRegion(int x, int y)
-        {
-            return x >= Left && x <= Right && y >= Bottom && y <= Top;
-        }
-    }
-
-    #endregion Structs
-
     #region Map Item Classes
 
     /// <summary>
@@ -160,10 +50,10 @@ namespace LibreMetaverse
         public uint GlobalY;
 
         /// <summary>Get the Local X position of the item</summary>
-        public uint LocalX => GlobalX % Simulator.DefaultRegionSizeX;
+        public uint LocalX => GlobalX % RegionDefaults.SizeX;
 
         /// <summary>Get the Local Y position of the item</summary>
-        public uint LocalY => GlobalY % Simulator.DefaultRegionSizeY;
+        public uint LocalY => GlobalY % RegionDefaults.SizeY;
 
         /// <summary>Get the Handle of the region</summary>
         public ulong RegionHandle => PositionHelper.RegionHandleFromGlobal(GlobalX, GlobalY);
@@ -573,7 +463,6 @@ namespace LibreMetaverse
             };
             Client.Network.SendPacket(request);
         }
-
 
         /// <summary>Asynchronously retrieves <see cref="GridRegion"/> information using the region name</summary>
         public async Task<GridRegion?> GetGridRegionAsync(string name, GridLayerType layer, CancellationToken cancellationToken = default)

@@ -48,11 +48,11 @@ namespace LibreMetaverse
         /// <remarks>
         /// Known simplifications versus a full creator-tool uploader:
         /// <list type="bullet">
-        /// <item>Only a single LOD (<c>high_lod</c>) is sent per prim -- <see cref="ModelPrim.CreateAsset"/>
-        /// does not generate reduced medium/low/lowest LODs. The simulator accepts this; every
-        /// viewing distance simply renders the same (full-detail) geometry.</item>
-        /// <item>Physics uses a fixed placeholder convex hull (<see cref="ModelPrim.PhysicsStub"/>)
-        /// rather than a real decomposition of the uploaded geometry.</item>
+        /// <item>The medium, low and lowest levels of detail are made by simplifying each face, a third, a ninth and
+        /// a twenty-seventh of the triangles as the reference viewer does by default, and the physics shape is one convex hull of the
+        /// mesh (a rigged mesh keeps a unit cube). Both can be turned off, or tuned, with <see cref="ModelAssetOptions"/>.
+        /// There is no convex decomposition of the shape, no separate physics mesh and no way to give your own
+        /// levels of detail.</item>
         /// <item>The fee-quote request sends only image dimensions for each texture, not the real
         /// J2C bytes (matching the reference viewer). Dimensions come from <see cref="ModelMaterial.Width"/>/
         /// <see cref="ModelMaterial.Height"/>, which <c>ColladaLoader</c> (LibreMetaverse.ImportExport package) fills in for any
@@ -77,23 +77,44 @@ namespace LibreMetaverse
         /// If <c>null</c>, the upload always proceeds.</param>
         /// <param name="cancellationToken">Cancellation token.</param>
         /// <param name="progress">Optional upload progress reporter.</param>
-        public async Task<CreateItemFromAssetResult> UploadModelAsync(
+        /// <param name="options">What to make of the mesh besides its full detail: lower levels of detail and a physics
+        /// shape. If <c>null</c>, both are made.</param>
+        /// <returns>
+        /// The outcome. Before anything is sent the model is run through <see cref="ModelUploadChecks"/>; if that finds
+        /// an error nothing is sent, <c>Success</c> is false and <c>Status</c> is <c>invalid_model</c>.
+        /// <see cref="ModelUploadResult.Diagnostics"/> says what it found, and also carries warnings for an upload that went ahead.
+        /// </returns>
+        public async Task<ModelUploadResult> UploadModelAsync(
             IReadOnlyList<ModelPrim> prims, string name, string description, UUID folderID,
             Permissions permissions, Func<int, bool>? confirmCost = null,
-            CancellationToken cancellationToken = default, IProgress<HttpCapsClient.ProgressReport>? progress = null)
+            CancellationToken cancellationToken = default, IProgress<HttpCapsClient.ProgressReport>? progress = null,
+            ModelAssetOptions? options = null)
         {
             if (prims == null) { throw new ArgumentNullException(nameof(prims)); }
             if (prims.Count == 0) { throw new ArgumentException("At least one ModelPrim is required", nameof(prims)); }
+            options ??= new ModelAssetOptions();
+            options.Validate();
 
-            var result = new CreateItemFromAssetResult
+            var diagnostics = new List<ModelDiagnostic>(ModelUploadChecks.Check(prims));
+            var result = new ModelUploadResult
             {
                 Success = false,
                 Status = "",
                 ItemID = UUID.Zero,
                 AssetID = UUID.Zero,
                 Error = null,
-                RawResult = null
+                RawResult = null,
+                Diagnostics = diagnostics
             };
+
+            // What the grid would refuse or mangle is found here, without contacting it
+            var firstError = diagnostics.FirstOrDefault(d => d.Severity == ModelDiagnosticSeverity.Error);
+            if (firstError != null)
+            {
+                result.Status = "invalid_model";
+                result.Error = new InvalidOperationException(firstError.Message);
+                return result;
+            }
 
             var cap = GetCapabilityURI("NewFileAgentInventory", false);
             if (cap == null)
@@ -103,6 +124,7 @@ namespace LibreMetaverse
                 return result;
             }
 
+            bool building = true;
             try
             {
                 // mesh_list/instance_list are identical for both phases and built once; texture_list
@@ -112,7 +134,8 @@ namespace LibreMetaverse
                 // through by ColladaLoader without ever being decoded), fall back to sending real
                 // bytes for the quote too -- the reference viewer's fallback is to measure the actual
                 // texture rather than ever quote against width=0/height=0.
-                var assetResources = BuildAssetResources(prims, Client.Self.AgentID, out var texturesInOrder);
+                var assetResources = BuildAssetResources(prims, Client.Self.AgentID, options, cancellationToken, out var texturesInOrder);
+                building = false;
                 var haveAllDimensions = texturesInOrder.All(m => m.Width > 0 && m.Height > 0);
                 ApplyTextureList(assetResources, texturesInOrder, includeTextures: !haveAllDimensions);
 
@@ -199,6 +222,10 @@ namespace LibreMetaverse
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
+                // The checks should have caught whatever building the mesh refuses, so this is a gap in them
+                if (building)
+                    diagnostics.Add(new ModelDiagnostic(ModelDiagnosticSeverity.Error, ModelDiagnosticCode.InvalidModel, ex.Message));
+
                 result.Success = false;
                 result.Error = ex;
                 result.Status = ex.Message;
@@ -216,7 +243,8 @@ namespace LibreMetaverse
         /// mesh dedup, no multi-LOD, no real physics).
         /// </summary>
         private static OSDMap BuildAssetResources(
-            IReadOnlyList<ModelPrim> prims, UUID creatorId, out List<ModelMaterial> texturesInOrder)
+            IReadOnlyList<ModelPrim> prims, UUID creatorId, ModelAssetOptions options, CancellationToken cancellationToken,
+            out List<ModelMaterial> texturesInOrder)
         {
             var meshList = new OSDArray();
             var instanceList = new OSDArray();
@@ -226,7 +254,8 @@ namespace LibreMetaverse
             for (var i = 0; i < prims.Count; i++)
             {
                 var prim = prims[i];
-                prim.CreateAsset(creatorId);
+                cancellationToken.ThrowIfCancellationRequested();
+                prim.CreateAsset(creatorId, options, cancellationToken);
                 meshList.Add(OSD.FromBinary(prim.Asset));
 
                 var instanceEntry = new OSDMap

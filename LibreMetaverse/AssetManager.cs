@@ -38,123 +38,6 @@ using LibreMetaverse.Messages.Linden;
 
 namespace LibreMetaverse
 {
-    #region Enums
-
-    public enum EstateAssetType : int
-    {
-        None = -1,
-        Covenant = 0
-    }
-
-    /// <summary>
-    /// 
-    /// </summary>
-    public enum StatusCode
-    {
-        /// <summary>OK</summary>
-        OK = 0,
-        /// <summary>Transfer completed</summary>
-        Done = 1,
-        /// <summary></summary>
-        Skip = 2,
-        /// <summary></summary>
-        Abort = 3,
-        /// <summary>Unknown error occurred</summary>
-        Error = -1,
-        /// <summary>Equivalent to a 404 error</summary>
-        UnknownSource = -2,
-        /// <summary>Client does not have permission for that resource</summary>
-        InsufficientPermissions = -3,
-        /// <summary>Unknown status</summary>
-        Unknown = -4
-    }
-
-    /// <summary>
-    /// 
-    /// </summary>
-    public enum ChannelType : int
-    {
-        /// <summary></summary>
-        Unknown = 0,
-        /// <summary>Unknown</summary>
-        Misc = 1,
-        /// <summary>Virtually all asset transfers use this channel</summary>
-        Asset = 2
-    }
-
-    /// <summary>
-    /// 
-    /// </summary>
-    public enum SourceType : int
-    {
-        /// <summary></summary>
-        Unknown = 0,
-        /// <summary>Asset from the asset server</summary>
-        Asset = 2,
-        /// <summary>Inventory item</summary>
-        SimInventoryItem = 3,
-        /// <summary>Estate asset, such as an estate covenant</summary>
-        SimEstate = 4
-    }
-
-    /// <summary>
-    /// 
-    /// </summary>
-    public enum TargetType : int
-    {
-        /// <summary></summary>
-        Unknown = 0,
-        /// <summary></summary>
-        File = 1,
-        /// <summary></summary>
-        VFile = 2
-    }
-
-    /// <summary>
-    /// When requesting image download, type of the image requested
-    /// </summary>
-    public enum ImageType : byte
-    {
-        /// <summary>Normal in-world object texture</summary>
-        Normal = 0,
-        /// <summary>Avatar texture</summary>
-        Baked = 1,
-        /// <summary>Server baked avatar texture</summary>
-        ServerBaked = 2
-    }
-
-    /// <summary>
-    /// Image file format
-    /// </summary>
-    public enum ImageCodec : byte
-    {
-        Invalid = 0,
-        RGB = 1,
-        J2C = 2,
-        BMP = 3,
-        TGA = 4,
-        JPEG = 5,
-        DXT = 6,
-        PNG = 7
-    }
-
-    public enum TransferError : int
-    {
-        None = 0,
-        Failed = -1,
-        AssetNotFound = -3,
-        AssetNotFoundInDatabase = -4,
-        InsufficientPermissions = -5,
-        EOF = -39,
-        CannotOpenFile = -42,
-        FileNotFound = -43,
-        FileIsEmpty = -44,
-        TCPTimeout = -23016,
-        CircuitGone = -23017
-    }
-
-    #endregion Enums
-
     #region Transfer Classes
 
     /// <summary>
@@ -279,7 +162,6 @@ namespace LibreMetaverse
             Priority = priority;
             DiscardLevel = discardLevel;
         }
-
     }
     #endregion Transfer Classes
 
@@ -470,7 +352,6 @@ namespace LibreMetaverse
 
             // Simulator is responding to a request to download a file
             Client.Network.RegisterCallback(PacketType.InitiateDownload, InitiateDownloadPacketHandler);
-
         }
 
         // TODO: Probably somewhere else is a more useful place to keep this.
@@ -618,7 +499,6 @@ namespace LibreMetaverse
             {
                 RequestAssetUDP(assetID, itemID, taskID, transfer, callback);
             }
-
         }
 
         /// <summary>
@@ -691,7 +571,6 @@ namespace LibreMetaverse
         private void RequestAssetUDP(UUID assetID, UUID itemID, UUID taskID, 
             AssetDownload transfer, AssetReceivedCallback? callback, CancellationToken cancellationToken = default)
         {
-
             // Add this transfer to the dictionary
             Transfers[transfer.ID] = transfer;
 
@@ -853,7 +732,6 @@ namespace LibreMetaverse
             {
                 RequestInventoryAssetUDP(assetID, itemID, taskID, ownerID, transfer, callback);
             }
-
             
         }
 

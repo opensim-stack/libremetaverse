@@ -37,97 +37,6 @@ using LibreMetaverse.Messages.Linden;
 
 namespace LibreMetaverse
 {
-    #region Enums
-
-    /// <summary>
-    /// Reason for submitting a request or report to the simulator
-    /// </summary>
-    public enum ReportType : uint
-    {
-        /// <summary>No report</summary>
-        None = 0,
-        /// <summary>Unknown report type</summary>
-        Unknown = 1,
-        /// <summary>Bug report</summary>
-        Bug = 2,
-        /// <summary>Complaint report</summary>
-        Complaint = 3,
-        /// <summary>Customer service report</summary>
-        CustomerServiceRequest = 4
-    }
-
-    /// <summary>
-    /// Bitflag field for ObjectUpdateCompressed data blocks, describing
-    /// which options are present for each object
-    /// </summary>
-    [Flags]
-    public enum CompressedFlags : uint
-    {
-        None = 0x00,
-        /// <summary>Unknown</summary>
-        ScratchPad = 0x01,
-        /// <summary>Whether the object has a TreeSpecies</summary>
-        Tree = 0x02,
-        /// <summary>Whether the object has floating text ala llSetText</summary>
-        HasText = 0x04,
-        /// <summary>Whether the object has an active particle system</summary>
-        HasParticles = 0x08,
-        /// <summary>Whether the object has sound attached to it</summary>
-        HasSound = 0x10,
-        /// <summary>Whether the object is attached to a root object or not</summary>
-        HasParent = 0x20,
-        /// <summary>Whether the object has texture animation settings</summary>
-        TextureAnimation = 0x40,
-        /// <summary>Whether the object has an angular velocity</summary>
-        HasAngularVelocity = 0x80,
-        /// <summary>Whether the object has a name value pairs string</summary>
-        HasNameValues = 0x100,
-        /// <summary>Whether the object has a Media URL set</summary>
-        MediaURL = 0x200,
-        /// <summary>Whether the object has, you guessed it, new particles</summary>
-        HasParticlesNew = 0x400
-    }
-
-    /// <summary>
-    /// Specific Flags for MultipleObjectUpdate requests
-    /// </summary>
-    [Flags]
-    public enum UpdateType : uint
-    {
-        /// <summary>None</summary>
-        None = 0x00,
-        /// <summary>Change position of prims</summary>
-        Position = 0x01,
-        /// <summary>Change rotation of prims</summary>
-        Rotation = 0x02,
-        /// <summary>Change size of prims</summary>
-        Scale = 0x04,
-        /// <summary>Perform operation on link set</summary>
-        Linked = 0x08,
-        /// <summary>Scale prims uniformly, same as selecting ctrl+shift in the
-        /// viewer. Used in conjunction with Scale</summary>
-        Uniform = 0x10
-    }
-
-    /// <summary>
-    /// Special values in PayPriceReply. If the price is not one of these
-    /// literal value of the price should be use
-    /// </summary>
-    public enum PayPriceType : int
-    {
-        /// <summary>
-        /// Indicates that this pay option should be hidden
-        /// </summary>
-        Hide = -1,
-
-        /// <summary>
-        /// Indicates that this pay option should have the default value
-        /// </summary>
-        Default = -2
-    }
-
-    #endregion Enums
-
     #region Structs
 
     /// <summary>
@@ -1173,7 +1082,6 @@ namespace LibreMetaverse
              };
 
              Client.Network.SendPacket(grab, simulator);
-
 
             // Use async delay instead of blocking the thread; respect cancellation but always send degrab
             try
@@ -2455,8 +2363,6 @@ namespace LibreMetaverse
         }
         #endregion
 
-
-
         #region Utility Functions
 
         /// <summary>
@@ -2569,7 +2475,6 @@ namespace LibreMetaverse
 
             av.ParentID = localid;
 
-
             if (m_AvatarSitChanged != null && oldSeatID != localid)
             {
                 OnAvatarSitChanged(new AvatarSitChangedEventArgs(sim, av, localid, oldSeatID));
@@ -2585,7 +2490,6 @@ namespace LibreMetaverse
         {
             s.Stats.Dilation = dilation / 65535.0f;
         }
-
 
         /// <summary>
         /// Set the Shape data of an object
@@ -2657,7 +2561,6 @@ namespace LibreMetaverse
 
             Client.Network.SendPacket(matPacket, simulator);
         }
-
 
         #endregion Utility Functions
 

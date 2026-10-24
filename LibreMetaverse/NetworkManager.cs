@@ -84,29 +84,14 @@ namespace LibreMetaverse
         /// Holds a simulator reference and a serialized packet, these structs are put in
         /// the packet outbox for sending
         /// </summary>
-        public class OutgoingPacket
+        public class OutgoingPacket : OutgoingDatagram
         {
             /// <summary>Reference to the simulator this packet is destined for</summary>
             public readonly Simulator Simulator;
-            /// <summary>Packet that needs to be sent</summary>
-            public readonly UDPPacketBuffer Buffer;
-            /// <summary>Sequence number of the wrapped packet</summary>
-            public uint SequenceNumber;
-            /// <summary>Number of times this packet has been resent</summary>
-            public int ResendCount;
-            /// <summary>Environment.TickCount when this packet was last sent over the wire</summary>
-            public int TickCount;
-            /// <summary>Type of the packet</summary>
-            public PacketType Type;
 
-            public OutgoingPacket(Simulator simulator, UDPPacketBuffer buffer, PacketType type)
+            public OutgoingPacket(Simulator simulator, UDPPacketBuffer buffer, PacketType type) : base(buffer, type)
             {
                 Simulator = simulator;
-                Buffer = buffer;
-                SequenceNumber = 0;
-                ResendCount = 0;
-                TickCount = 0;
-                Type = type;
             }
         }
 
@@ -590,7 +575,7 @@ namespace LibreMetaverse
         /// <returns></returns>
         public Simulator? Connect(IPAddress ip, ushort port, ulong handle, bool setDefault, Uri? seedcaps)
         {
-            return Connect(ip, port, handle, setDefault, seedcaps, Simulator.DefaultRegionSizeX, Simulator.DefaultRegionSizeY);
+            return Connect(ip, port, handle, setDefault, seedcaps, RegionDefaults.SizeX, RegionDefaults.SizeY);
         }
         /// <summary>
         /// Connect to a simulator
@@ -621,7 +606,7 @@ namespace LibreMetaverse
         /// <param name="seedcaps"></param>
         /// <returns></returns>
         public Simulator? Connect(IPEndPoint endPoint, ulong handle, bool setDefault, Uri? seedcaps) {
-            return Connect(endPoint, handle, setDefault, seedcaps, Simulator.DefaultRegionSizeX, Simulator.DefaultRegionSizeY);
+            return Connect(endPoint, handle, setDefault, seedcaps, RegionDefaults.SizeX, RegionDefaults.SizeY);
         }
         /// <summary>
         /// Connect to a simulator

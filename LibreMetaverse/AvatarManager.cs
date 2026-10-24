@@ -38,154 +38,6 @@ using LibreMetaverse.StructuredData;
 
 namespace LibreMetaverse
 {
-
-    #region Structs
-    /// <summary> Information about agents display name </summary>
-    public class AgentDisplayName
-    {
-        /// <summary> Agent UUID </summary>
-        public UUID ID { get; set; }
-        /// <summary> Username </summary>
-        public string? UserName { get; set; }
-        /// <summary> Display name </summary>
-        public string? DisplayName { get; set; }
-        /// <summary> First name (legacy) </summary>
-        public string? LegacyFirstName { get; set; }
-        /// <summary> Last name (legacy) </summary>
-        public string? LegacyLastName { get; set; }
-        /// <summary> Full name (legacy) </summary>
-        public string LegacyFullName => $"{LegacyFirstName} {LegacyLastName}";
-        /// <summary> Is display name default display name </summary>
-        public bool IsDefaultDisplayName { get; set; }
-        /// <summary> Cache display name until </summary>
-        public DateTime NextUpdate { get; set; }
-        /// <summary> Last updated timestamp </summary>
-        public DateTime Updated { get; set; }
-
-        /// <summary>
-        /// Creates AgentDisplayName object from OSD
-        /// </summary>
-        /// <param name="data">Incoming OSD data</param>
-        /// <returns>AgentDisplayName object</returns>
-        public static AgentDisplayName FromOSD(OSD data)
-        {
-            AgentDisplayName ret = new AgentDisplayName();
-
-            OSDMap map = (OSDMap)data;
-            ret.ID = map["id"];
-            ret.UserName = map["username"];
-            ret.DisplayName = map["display_name"];
-            ret.LegacyFirstName = map["legacy_first_name"];
-            ret.LegacyLastName = map["legacy_last_name"];
-            ret.IsDefaultDisplayName = map["is_display_name_default"];
-            ret.NextUpdate = map["display_name_next_update"];
-            ret.Updated = map["last_updated"];
-
-            return ret;
-        }
-
-        /// <summary>
-        /// Return object as OSD map
-        /// </summary>
-        /// <returns>OSD containing agent's display name data</returns>
-        public OSD GetOSD()
-        {
-            OSDMap map = new OSDMap
-            {
-                ["id"] = ID,
-                ["username"] = OSD.FromString(UserName ?? string.Empty),
-                ["display_name"] = OSD.FromString(DisplayName ?? string.Empty),
-                ["legacy_first_name"] = OSD.FromString(LegacyFirstName ?? string.Empty),
-                ["legacy_last_name"] = OSD.FromString(LegacyLastName ?? string.Empty),
-                ["is_display_name_default"] = IsDefaultDisplayName,
-                ["display_name_next_update"] = NextUpdate,
-                ["last_updated"] = Updated
-            };
-            return map;
-        }
-
-        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2026", Justification = "StructToString is a debug helper; reflection loss is acceptable here.")]
-        public override string ToString()
-        {
-            return Helpers.StructToString(this);
-        }
-    }
-
-    /// <summary>
-    /// Holds group information for Avatars such as those you might find in a profile
-    /// </summary>
-    public struct AvatarGroup
-    {
-        /// <summary>true of Avatar accepts group notices</summary>
-        public bool AcceptNotices;
-        /// <summary>Groups Key</summary>
-        public UUID GroupID;
-        /// <summary>Texture Key for groups insignia</summary>
-        public UUID GroupInsigniaID;
-        /// <summary>Name of the group</summary>
-        public string GroupName;
-        /// <summary>Powers avatar has in the group</summary>
-        public GroupPowers GroupPowers;
-        /// <summary>Avatars Currently selected title</summary>
-        public string GroupTitle;
-        /// <summary>true of Avatar has chosen to list this in their profile</summary>
-        public bool ListInProfile;
-    }
-
-    /// <summary>
-    /// Contains an animation currently being played by an agent
-    /// </summary>
-    public struct Animation
-    {
-        /// <summary>The ID of the animation asset</summary>
-        public UUID AnimationID;
-        /// <summary>A number to indicate start order of currently playing animations</summary>
-        /// <remarks>On Linden Grids this number is unique per region, with OpenSim it is per client</remarks>
-        public int AnimationSequence;
-        /// <summary></summary>
-        public UUID AnimationSourceObjectID;
-    }
-
-    /// <summary>
-    /// Holds group information on an individual profile pick
-    /// </summary>
-    public struct ProfilePick
-    {
-        public UUID PickID;
-        public UUID CreatorID;
-        public bool TopPick;
-        public UUID ParcelID;
-        public string Name;
-        public string Desc;
-        public UUID SnapshotID;
-        public string User;
-        public string OriginalName;
-        public string SimName;
-        public Vector3d PosGlobal;
-        public int SortOrder;
-        public bool Enabled;
-    }
-
-    public struct ClassifiedAd
-    {
-        public UUID ClassifiedID;
-        public UUID CreatorID;
-        public uint CreationDate;
-        public uint ExpirationDate;
-        public uint Category;
-        public UUID ParcelID;
-        public uint ParentEstate;
-        public UUID SnapShotID;
-        public Vector3d Position;
-        public string SimName;
-        public string ParcelName;
-        public byte ClassifiedFlags;
-        public int Price;
-        public string Name;
-        public string Desc;
-    }
-    #endregion
-
     /// <summary>
     /// Retrieve friend status notifications, and retrieve avatar names and
     /// profiles
@@ -1065,7 +917,6 @@ namespace LibreMetaverse
                 {
                     av.Animations = signaledAnimations;
                 }
-
             }
 
             if (!found)
@@ -1888,7 +1739,6 @@ namespace LibreMetaverse
         }
     }
 
-
     public class AvatarGroupsReplyEventArgs : EventArgs
     {
         /// <summary>Get the ID of the agent</summary>
@@ -1921,7 +1771,6 @@ namespace LibreMetaverse
     {
         public UUID PickID { get; }
         public ProfilePick Pick { get; }
-
 
         public PickInfoReplyEventArgs(UUID pickid, ProfilePick pick)
         {

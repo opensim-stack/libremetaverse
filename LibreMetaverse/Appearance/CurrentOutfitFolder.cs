@@ -30,6 +30,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using LibreMetaverse.StructuredData;
 
 namespace LibreMetaverse.Appearance
 {
@@ -62,7 +63,7 @@ namespace LibreMetaverse.Appearance
         /// <summary>
         /// Maximum number of clothing layers that can be worn simultaneously
         /// </summary>
-        public int MaxClothingLayers => 60;
+        public int MaxClothingLayers => AppearanceManager.WEARABLE_COUNT_MAX;
 
         private readonly SemaphoreSlim cofInitLock = new SemaphoreSlim(1, 1);
         private Task<bool>? cofInitTask;
@@ -466,16 +467,7 @@ namespace LibreMetaverse.Appearance
 
         protected async Task AddLink(InventoryItem item, CancellationToken cancellationToken = default)
         {
-            if (item is InventoryWearable wearableItem && !IsBodyPart(item))
-            {
-                var layer = 0;
-                var description = $"{(int)wearableItem.WearableType}{layer:00}";
-                await AddLink(item, description, cancellationToken);
-            }
-            else
-            {
-                await AddLink(item, string.Empty, cancellationToken);
-            }
+            await AddLink(item, GetCofLinkDescription(item), cancellationToken);
         }
 
         protected async Task AddLink(InventoryItem item, string newDescription, CancellationToken cancellationToken = default)
@@ -496,11 +488,37 @@ namespace LibreMetaverse.Appearance
             }
         }
 
-        internal string GetCofLinkDescription(InventoryItem item)
+        /// <summary>Marks a COF link description as layer ordering information, as the viewer does</summary>
+        private const char OrderNumberSeparator = '@';
+
+        /// <summary>
+        /// The description the viewer expects on the COF link of a clothing layer: "@" followed by
+        /// <c>wearable type * 100 + layer index</c>, e.g. "@1301" for the second alpha. Anything else is treated
+        /// as invalid, and the viewer then reorders the layers by item name.
+        /// </summary>
+        internal string GetCofLinkDescription(InventoryItem item, int layer = 0)
         {
             if (item is InventoryWearable wearable && !IsBodyPart(item))
-                return $"{(int)wearable.WearableType}00";
+                return $"{OrderNumberSeparator}{(int)wearable.WearableType * 100 + layer}";
             return string.Empty;
+        }
+
+        /// <summary>
+        /// Reads the layer ordering information of a COF link description written by <see cref="GetCofLinkDescription"/>
+        /// </summary>
+        internal static bool TryParseCofLinkDescription(string description, out WearableType type, out int layer)
+        {
+            type = WearableType.Invalid;
+            layer = 0;
+            if (string.IsNullOrEmpty(description) || description[0] != OrderNumberSeparator ||
+                !int.TryParse(description.Substring(1), out var order) || order < 0 || order / 100 >= (int)WearableType.Invalid)
+            {
+                return false;
+            }
+
+            type = (WearableType)(order / 100);
+            layer = order % 100;
+            return true;
         }
 
         /// <summary>
@@ -518,14 +536,124 @@ namespace LibreMetaverse.Appearance
             var cofLinks = await GetCurrentOutfitLinksAsync(cancellationToken);
             var existingAssetIds = new HashSet<UUID>(cofLinks.Select(l => l.AssetUUID));
 
-            var linksToCreate = items
-                .Where(item => !existingAssetIds.Contains(item.UUID))
-                .Select(item => ((InventoryBase)item, GetCofLinkDescription(item)))
-                .ToList();
+            var newItems = items.Where(item => !existingAssetIds.Contains(item.UUID)).ToList();
+
+            await RenumberLayerLinksAsync(cofLinks,
+                new HashSet<WearableType>(newItems.OfType<InventoryWearable>().Where(w => !IsBodyPart(w)).Select(w => w.WearableType)),
+                cancellationToken).ConfigureAwait(false);
+
+            // New layers go on top of the ones already linked
+            var nextLayer = NextLayerIndexes(cofLinks);
+
+            var linksToCreate = new List<(InventoryBase, string)>();
+            foreach (var item in newItems)
+            {
+                var layer = 0;
+                if (item is InventoryWearable wearable && !IsBodyPart(item))
+                {
+                    nextLayer.TryGetValue(wearable.WearableType, out layer);
+                    nextLayer[wearable.WearableType] = layer + 1;
+                }
+                linksToCreate.Add((item, GetCofLinkDescription(item, layer)));
+            }
 
             if (linksToCreate.Count == 0) return;
 
             await client.Inventory.CreateLinksAsync(COF.UUID, linksToCreate, null, cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>The layer index a new link of each wearable type should get, after the ones already linked</summary>
+        internal static Dictionary<WearableType, int> NextLayerIndexes(IEnumerable<InventoryItem> cofLinks)
+        {
+            var nextLayer = new Dictionary<WearableType, int>();
+            foreach (var link in cofLinks)
+            {
+                if (TryParseCofLinkDescription(link.Description, out var type, out var layer) &&
+                    (!nextLayer.TryGetValue(type, out var next) || layer >= next))
+                {
+                    nextLayer[type] = layer + 1;
+                }
+            }
+            return nextLayer;
+        }
+
+        /// <summary>
+        /// The order the viewer would give the layers of one type: links with an order string first, by that string,
+        /// then the ones without by how they are worn, then by name
+        /// </summary>
+        internal static List<InventoryItem> OrderLayerLinks(IEnumerable<(InventoryItem Link, bool Valid, int Layer, int WornIndex)> layers)
+        {
+            return layers
+                .OrderBy(l => l.Valid ? 0 : 1)
+                .ThenBy(l => l.Layer)
+                .ThenBy(l => l.WornIndex)
+                .ThenBy(l => l.Link.Name, StringComparer.Ordinal)
+                .Select(l => l.Link)
+                .ToList();
+        }
+
+        /// <summary>
+        /// Gives the clothing links of the given types descriptions the viewer accepts, keeping their current order.
+        /// Links written before we used the viewer's format have none, and the viewer sorts those above every link that
+        /// has one, so a new link could not be placed on top of them without renumbering them first.
+        /// </summary>
+        private async Task RenumberLayerLinksAsync(List<InventoryItem> cofLinks, ISet<WearableType> types, CancellationToken cancellationToken)
+        {
+            if (types.Count == 0) return;
+
+            var worn = client.Appearance.GetWearablesByType();
+            foreach (var type in types)
+            {
+                var layers = new List<(InventoryItem Link, bool Valid, int Layer, int WornIndex)>();
+                foreach (var link in cofLinks)
+                {
+                    var valid = TryParseCofLinkDescription(link.Description, out var linkType, out var layer);
+                    var wornIndex = int.MaxValue;
+                    if (!valid)
+                    {
+                        if (!(ResolveInventoryLink(link) is InventoryWearable target) || target.AssetType != AssetType.Clothing)
+                        {
+                            continue;
+                        }
+
+                        linkType = target.WearableType;
+                        if (worn.TryGetValue(type, out var wornOfType))
+                        {
+                            var index = wornOfType.Select(w => w.ItemID).ToList().IndexOf(target.UUID);
+                            if (index >= 0) wornIndex = index;
+                        }
+                    }
+
+                    if (linkType == type)
+                    {
+                        layers.Add((link, valid, layer, wornIndex));
+                    }
+                }
+
+                if (layers.All(l => l.Valid)) continue;
+
+                var ordered = OrderLayerLinks(layers);
+                for (var i = 0; i < ordered.Count; i++)
+                {
+                    var link = ordered[i];
+                    var description = $"{OrderNumberSeparator}{(int)type * 100 + i}";
+                    if (link.Description == description) continue;
+
+                    if (client.AisClient.IsAvailable)
+                    {
+                        if (!await client.AisClient.UpdateItemAsync(link.UUID, new OSDMap { ["desc"] = description }, cancellationToken).ConfigureAwait(false))
+                        {
+                            continue;
+                        }
+                        link.Description = description;
+                    }
+                    else
+                    {
+                        link.Description = description;
+                        client.Inventory.RequestUpdateItem(link);
+                    }
+                }
+            }
         }
 
         protected async Task RemoveLinksToByActualId(IEnumerable<UUID> actualItemIdsToRemoveLinksTo, CancellationToken cancellationToken = default)
@@ -822,7 +950,7 @@ namespace LibreMetaverse.Appearance
             }
 
             var newOutfitItemMap = new Dictionary<UUID, InventoryItem>();
-            var existingBodypartLinks = new List<InventoryItem>();
+            var existingBodypartLinks = new List<(InventoryItem Link, InventoryItem Target)>();
             var bodypartsToWear = new Dictionary<WearableType, InventoryWearable>();
             var gesturesToActivate = new Dictionary<UUID, InventoryItem>();
             var numClothingLayers = 0;
@@ -897,11 +1025,8 @@ namespace LibreMetaverse.Appearance
                 newOutfitItemMap[inventoryItem.UUID] = inventoryItem;
             }
 
-            var existingLinkTargets = currentOutfitContents
-                .OfType<InventoryItem>()
-                .Where(n => !n.IsLink())
-                .ToDictionary(k => k.UUID, v => v);
             var linksToRemove = new List<InventoryItem>();
+            var keptTargets = new HashSet<UUID>();
             var gesturesToDeactivate = new HashSet<UUID>();
 
             foreach (var item in currentOutfitContents)
@@ -916,7 +1041,12 @@ namespace LibreMetaverse.Appearance
                     continue;
                 }
 
-                if (!existingLinkTargets.TryGetValue(itemLink.AssetUUID, out var realItem))
+                // The COF only holds links, so the item a link points at has to come from the inventory store.
+                // Looking for it among the COF's own contents never finds anything, which made every outfit change
+                // strip all of the links and put them back, rather than leaving the ones that are still wanted.
+                // Folder links (the link to the outfit folder itself) are always replaced.
+                var realItem = itemLink.AssetType == AssetType.Link ? ResolveInventoryLink(itemLink) : null;
+                if (realItem == null)
                 {
                     linksToRemove.Add(itemLink);
                     continue;
@@ -926,12 +1056,17 @@ namespace LibreMetaverse.Appearance
                 {
                     // We're already wearing the item that exists in the new outfit, don't re-add links to it
                     itemsBeingAdded.Remove(realItem.UUID);
+                    if (!keptTargets.Add(realItem.UUID))
+                    {
+                        // A second link to the same item adds nothing
+                        linksToRemove.Add(itemLink);
+                    }
                     continue;
                 }
 
                 if (realItem.AssetType == AssetType.Bodypart)
                 {
-                    existingBodypartLinks.Add(itemLink);
+                    existingBodypartLinks.Add((itemLink, realItem));
                     continue;
                 }
 
@@ -959,31 +1094,38 @@ namespace LibreMetaverse.Appearance
                 client.Self.ActivateGesture(item.UUID, item.AssetUUID);
             }
 
-            // Replace bodyparts, but keep old bodyparts if new outfit lacks them
-            foreach (var existingLink in existingBodypartLinks)
+            // Replace bodyparts, but keep old bodyparts if new outfit lacks them. A kept bodypart keeps its
+            // existing link, so it must not be added again below.
+            var keptBodypartTypes = new HashSet<WearableType>();
+            foreach (var (existingLink, existingTarget) in existingBodypartLinks)
             {
-                if (existingLinkTargets.TryGetValue(existingLink.AssetUUID, out var realItem))
+                if (existingTarget is InventoryWearable wornBodypart &&
+                    bodypartsToWear.TryGetValue(wornBodypart.WearableType, out var wantedBodypart) &&
+                    wantedBodypart.UUID == wornBodypart.UUID &&
+                    keptBodypartTypes.Add(wornBodypart.WearableType))
                 {
-                    if (realItem is InventoryWearable existingBodypart)
-                    {
-                        if (!bodypartsToWear.ContainsKey(existingBodypart.WearableType))
-                        {
-                            bodypartsToWear[existingBodypart.WearableType] = existingBodypart;
-                            continue;
-                        }
-                    }
-
-                    itemsBeingRemoved[realItem.UUID] = realItem;
+                    // Already wearing this exact body part: leave its link alone, so the COF is never without one
+                    bodypartsToWear.Remove(wornBodypart.WearableType);
+                    continue;
                 }
 
+                if (existingTarget is InventoryWearable existingBodypart &&
+                    !bodypartsToWear.ContainsKey(existingBodypart.WearableType) &&
+                    keptBodypartTypes.Add(existingBodypart.WearableType))
+                {
+                    continue;
+                }
+
+                itemsBeingRemoved[existingTarget.UUID] = existingTarget;
                 linksToRemove.Add(existingLink);
             }
 
             // Bare minimum outfit check
-            if (!bodypartsToWear.ContainsKey(WearableType.Shape) ||
-                !bodypartsToWear.ContainsKey(WearableType.Skin) ||
-                !bodypartsToWear.ContainsKey(WearableType.Eyes) ||
-                !bodypartsToWear.ContainsKey(WearableType.Hair))
+            bool HasBodypart(WearableType type) => bodypartsToWear.ContainsKey(type) || keptBodypartTypes.Contains(type);
+            if (!HasBodypart(WearableType.Shape) ||
+                !HasBodypart(WearableType.Skin) ||
+                !HasBodypart(WearableType.Eyes) ||
+                !HasBodypart(WearableType.Hair))
             {
                 Logger.Error("New outfit must contain a Shape, Skin, Eyes, and Hair", client);
                 return false;
@@ -995,7 +1137,7 @@ namespace LibreMetaverse.Appearance
                 .Distinct();
             await client.Inventory.RemoveItemsAsync(toRemoveIds, cancellationToken);
 
-            // Add body parts from current outfit to new outfit if it's lacking those essential body parts
+            // Link the new outfit's body parts; kept body parts already have their links
             foreach (var item in bodypartsToWear)
             {
                 itemsBeingAdded.Add(item.Value.UUID, item.Value);
@@ -1131,11 +1273,31 @@ namespace LibreMetaverse.Appearance
                 }
             }
 
+            // Layers of a clothing type are ordered bottom to top, so the last one is the layer on top. The order
+            // comes from the wearables list, which is only as good as the order the COF was read in at login; layers
+            // it doesn't know about go underneath, keeping the order of the COF.
+            var layerOrder = client.Appearance.GetWearablesByType();
+            foreach (var layers in currentClothing)
+            {
+                if (!layerOrder.TryGetValue(layers.Key, out var wornLayers)) continue;
+
+                var order = wornLayers.Select((w, index) => (w.ItemID, index)).ToDictionary(k => k.ItemID, v => v.index);
+                var ordered = layers.Value.OrderBy(w => order.TryGetValue(w.UUID, out var index) ? index : -1).ToList();
+                layers.Value.Clear();
+                layers.Value.AddRange(ordered);
+            }
+            var addedThisCall = new HashSet<UUID>();
+
             var itemsToRemove = new List<InventoryItem>();
             var itemsToAdd = new List<InventoryItem>();
 
+            var isFirst = true;
             foreach (var item in requestedItemsToAdd)
             {
+                // Like the viewer, only the first item of a batch replaces; the rest are added.
+                var replaceThis = replace && isFirst;
+                isFirst = false;
+
                 var realItem = ResolveInventoryLink(item);
                 if (realItem == null)
                 {
@@ -1167,25 +1329,33 @@ namespace LibreMetaverse.Appearance
                 {
                     if (wearable.AssetType == AssetType.Clothing)
                     {
-                        if (replace)
+                        if (!currentClothing.TryGetValue(wearable.WearableType, out var currentClothingOfType))
                         {
-                            if (currentClothing.TryGetValue(wearable.WearableType, out var currentClothingOfType))
-                            {
-                                foreach (var clothingToRemove in currentClothingOfType)
-                                {
-                                    itemsToRemove.Add(clothingToRemove);
-                                }
-                            }
+                            currentClothingOfType = new List<InventoryWearable>();
+                            currentClothing[wearable.WearableType] = currentClothingOfType;
+                        }
+
+                        // Like the viewer, make room by taking off the top layer of the type only. Replacing every
+                        // layer of the type would take off all of the other alphas when wearing one. The same happens
+                        // when all layers are used up. Items added earlier in this same call are never taken off again.
+                        var displaceIndex = currentClothingOfType.FindLastIndex(w => !addedThisCall.Contains(w.UUID));
+                        var full = numClothingLayers >= MaxClothingLayers;
+                        if (displaceIndex >= 0 && (replaceThis || full))
+                        {
+                            itemsToRemove.Add(currentClothingOfType[displaceIndex]);
+                            currentClothingOfType.RemoveAt(displaceIndex);
+                        }
+                        else if (full)
+                        {
+                            continue;
                         }
                         else
                         {
-                            if (numClothingLayers >= MaxClothingLayers)
-                            {
-                                continue;
-                            }
-
                             numClothingLayers++;
                         }
+
+                        currentClothingOfType.Add(wearable);
+                        addedThisCall.Add(wearable.UUID);
                     }
                     else if (wearable.AssetType == AssetType.Bodypart)
                     {

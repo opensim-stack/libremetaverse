@@ -31,6 +31,8 @@ using System.Text.RegularExpressions;
 using LibreMetaverse.Assets.Gltf;
 using LibreMetaverse.Imaging;
 using LibreMetaverse.Rendering;
+using NumMatrix = System.Numerics.Matrix4x4;
+using NumVector3 = System.Numerics.Vector3;
 using Path = System.IO.Path;
 
 namespace LibreMetaverse.ImportExport
@@ -40,17 +42,21 @@ namespace LibreMetaverse.ImportExport
     /// <c>.glb</c>) into <see cref="ModelPrim"/> structures for mesh upload.
     /// </summary>
     /// <remarks>
-    /// Only static triangle meshes are read: skins, morph targets, animation, cameras and
-    /// lights are ignored, as are primitives that are not plain triangle lists. Only the base
+    /// Triangle meshes and skins are read; morph targets, animation, cameras and lights are
+    /// ignored, as are primitives that are not plain triangle lists. A skinned mesh becomes a rigged prim:
+    /// its weights go to the avatar joints the skin's nodes are named after (up to four a vertex, strongest
+    /// first), its inverse bind matrices are carried over, and the node's own transform is ignored, as the
+    /// glTF specification says. Joints whose names are not on the avatar skeleton are dropped, as are
+    /// influences beyond the fourth. Joint position overrides are not imported. Only the base
     /// color factor and base color texture of each material are used. Meshes compressed with
     /// Draco or meshopt, or quantized with KHR_mesh_quantization, are rejected.
     /// The input is treated as untrusted: accessors are bounds-checked before they are decoded
     /// and the amount of geometry is capped.
     /// </remarks>
-    public class GltfLoader : IModelLoader
+    public class GltfLoader : IDiagnosticModelLoader
     {
         // ModelPrim.CreateAsset writes face indices as 16 bit values
-        private const int MaxFaceVertices = ushort.MaxValue + 1;
+        private const int MaxFaceVertices = ModelPrim.MaxVerticesPerFace;
 
         // glTF is Y-up, Second Life is Z-up
         private static readonly Matrix4 YUpToZUp = ModelAxes.YUpToZUp;
@@ -68,6 +74,8 @@ namespace LibreMetaverse.ImportExport
         private readonly ITextureCodec? _textureCodec;
         private string _fileName = string.Empty;
         private long _vertexBudget;
+        private Dictionary<int, SkinInfo?> _skins = new Dictionary<int, SkinInfo?>();
+        private int[]? _nodeParents;
 
         /// <summary>
         /// Only load external buffers and textures from the directory of the model file and its
@@ -80,8 +88,32 @@ namespace LibreMetaverse.ImportExport
         /// <summary>Largest model, buffer or texture file that will be read, in bytes</summary>
         public long MaxFileSize { get; set; } = 256L * 1024 * 1024;
 
+        /// <summary>
+        /// How the joints of a skin are read. The bones of the avatar skeleton have no rotation at rest, but the
+        /// joints of a rig made in a modelling program often do (Blender turns a bone's axis to run along the
+        /// bone), and a mesh bound to those axes comes out turned around each joint on the avatar. When true,
+        /// the default, only each joint's position is taken from the file and its axes are the avatar's, which
+        /// is right for both kinds of rig. When false the inverse bind matrices are carried over exactly as they
+        /// are authored, which is right only for a rig whose joints have no rotation either.
+        /// </summary>
+        public bool UseAvatarJointAxes { get; set; } = true;
+
+        /// <summary>Most joints a skinned mesh may be weighted to (after those the avatar skeleton does not
+        /// have are dropped). A glTF skin usually lists a whole armature, and a mesh only counts the joints it has
+        /// weight on. The reference viewer ignores any beyond 110.</summary>
+        public int MaxJoints { get; set; } = ModelSkin.MaxJoints;
+
         /// <summary>Largest number of vertex attribute and index elements a model may contain in total</summary>
         public int MaxVertices { get; set; } = 4_000_000;
+
+        /// <summary>
+        /// Load the textures of each material's <see cref="ModelMaterial.Pbr"/> too (normal, metallic-roughness and emissive;
+        /// the base color is loaded in any case), prepared the way the viewer prepares them when it imports a glTF
+        /// material, and report what a Second Life material cannot hold (see <see cref="ModelDiagnosticCode.PbrApproximated"/>).
+        /// Off by default, because it decodes and compresses extra images, and the mesh upload does not use them. The material's
+        /// factors and the names of its textures are there either way.
+        /// </summary>
+        public bool LoadPbrTextures { get; set; }
 
         /// <summary>
         /// Creates a new glTF loader
@@ -103,13 +135,25 @@ namespace LibreMetaverse.ImportExport
         /// could not be read</returns>
         public List<ModelPrim> Load(string filename, bool loadImages)
         {
+            return new List<ModelPrim>(LoadWithDiagnostics(filename, loadImages).Prims);
+        }
+
+        /// <summary>
+        /// Parses a glTF or GLB file, and reports what it could not use
+        /// </summary>
+        /// <param name="filename">Load the model from this <c>.gltf</c> or <c>.glb</c> file</param>
+        /// <param name="loadImages">Load and decode images for uploading with model</param>
+        public ModelLoadResult LoadWithDiagnostics(string filename, bool loadImages)
+        {
+            _diagnostics = new ModelDiagnosticCollector();
+            var prims = new List<ModelPrim>();
             try
             {
                 _fileName = filename;
 
                 var info = new FileInfo(filename);
                 if (info.Length > MaxFileSize)
-                    throw new InvalidDataException($"Model file is larger than {MaxFileSize} bytes");
+                    throw new LimitExceededException($"Model file is larger than {MaxFileSize} bytes");
 
                 byte[] data = File.ReadAllBytes(filename);
                 CheckGlbStructure(data);
@@ -122,20 +166,27 @@ namespace LibreMetaverse.ImportExport
                 }
 
                 _vertexBudget = MaxVertices;
+                _skins = new Dictionary<int, SkinInfo?>();
+                _nodeParents = null;
+                _pbrSources = new List<PbrSource>();
                 var textureSources = new Dictionary<ModelMaterial, int>();
-                var prims = Parse(doc, textureSources);
+                prims = Parse(doc, textureSources);
+                if (LoadPbrTextures) WarnAboutMaterialExtensions(doc);
                 if (loadImages)
                 {
                     LoadImages(doc, textureSources);
+                    if (LoadPbrTextures) LoadPbrImages(doc);
                 }
-                return prims;
             }
             catch (Exception ex)
             {
-                Logger.Error("Failed parsing glTF file: " + ex.Message, ex);
-                return new List<ModelPrim>();
+                _diagnostics.ReportFailure(ex, "glTF");
+                prims = new List<ModelPrim>();
             }
+            return new ModelLoadResult(prims, _diagnostics.Diagnostics);
         }
+
+        private ModelDiagnosticCollector _diagnostics = new ModelDiagnosticCollector();
 
         #region Scene
 
@@ -143,6 +194,7 @@ namespace LibreMetaverse.ImportExport
         {
             public string Name = string.Empty;
             public int Mesh;
+            public int Skin = -1;
             public Matrix4 World;
         }
 
@@ -151,29 +203,51 @@ namespace LibreMetaverse.ImportExport
             public ModelPrim Template = new ModelPrim();
             public Vector3 AssetScale;
             public Vector3 AssetOffset;
+            public bool Skinned;
         }
 
         private List<ModelPrim> Parse(GltfDocument doc, Dictionary<ModelMaterial, int> textureSources)
         {
             var prims = new List<ModelPrim>();
-            var built = new Dictionary<int, BuiltMesh?>();
+            var built = new Dictionary<long, BuiltMesh?>();
             var materials = new Dictionary<int, ModelMaterial>();
             var defaultMaterial = new ModelMaterial { ID = "default" };
 
             foreach (var instance in FindMeshInstances(doc))
             {
-                if (!built.TryGetValue(instance.Mesh, out var mesh))
+                // The same mesh skinned two ways is two different assets
+                long key = instance.Mesh + ((instance.Skin + 1L) << 32);
+                if (!built.TryGetValue(key, out var mesh))
                 {
-                    mesh = BuildMesh(doc, instance.Mesh, materials, defaultMaterial, textureSources);
-                    built[instance.Mesh] = mesh;
+                    mesh = BuildMesh(doc, instance.Mesh, instance.Skin, materials, defaultMaterial, textureSources);
+                    built[key] = mesh;
                 }
                 if (mesh == null) continue;
+
+                if (mesh.Skinned)
+                {
+                    // A skinned mesh is placed by its joints, and its node's transform is not used. The prim
+                    // is sized like any other, to match the unit cube it was fitted into.
+                    prims.Add(new ModelPrim
+                    {
+                        ID = instance.Name,
+                        Asset = mesh.Template.Asset,
+                        BoundMin = mesh.Template.BoundMin,
+                        BoundMax = mesh.Template.BoundMax,
+                        Positions = mesh.Template.Positions,
+                        Faces = mesh.Template.Faces,
+                        Skin = mesh.Template.Skin,
+                        Position = mesh.AssetOffset,
+                        Scale = mesh.AssetScale
+                    });
+                    continue;
+                }
 
                 // Second Life is Z-up too, so move the node's world transform into that space
                 var world = ZUpToYUp * instance.World * YUpToZUp;
                 if (!world.Decompose(out var scale, out var rotation, out var position))
                 {
-                    Logger.Warn($"Skipping glTF node {instance.Name}: its transform has no volume");
+                    _diagnostics.Warn(ModelDiagnosticCode.NodeSkipped, $"Skipping glTF node {instance.Name}: its transform has no volume", instance.Name);
                     continue;
                 }
 
@@ -205,7 +279,7 @@ namespace LibreMetaverse.ImportExport
         /// Walks the default scene (or the first one, or every node nothing else parents) and
         /// returns each node that holds a mesh, with its world transform in glTF's own space.
         /// </summary>
-        private static List<MeshInstance> FindMeshInstances(GltfDocument doc)
+        private List<MeshInstance> FindMeshInstances(GltfDocument doc)
         {
             var instances = new List<MeshInstance>();
 
@@ -249,12 +323,12 @@ namespace LibreMetaverse.ImportExport
                 int index = item.Key;
                 if (index < 0 || index >= doc.Nodes.Count)
                 {
-                    Logger.Warn($"Ignoring reference to missing glTF node {index}");
+                    _diagnostics.Warn(ModelDiagnosticCode.NodeSkipped, $"Ignoring reference to missing glTF node {index}", index.ToString());
                     continue;
                 }
                 if (visited[index])
                 {
-                    Logger.Warn($"Ignoring glTF node {index}: it is reachable more than once");
+                    _diagnostics.Warn(ModelDiagnosticCode.NodeSkipped, $"Ignoring glTF node {index}: it is reachable more than once", doc.Nodes[index].Name);
                     continue;
                 }
                 visited[index] = true;
@@ -268,6 +342,7 @@ namespace LibreMetaverse.ImportExport
                     {
                         Name = string.IsNullOrEmpty(node.Name) ? "node" + index : node.Name!,
                         Mesh = node.Mesh,
+                        Skin = node.Skin,
                         World = world
                     });
                 }
@@ -303,15 +378,19 @@ namespace LibreMetaverse.ImportExport
             public Vector3[]? Normals;
             public Vector2[]? TexCoords;
             public uint[]? Indices;
+            public VertexWeight[]? Weights;
             public int TriangleCount;
             public ModelMaterial Material = new ModelMaterial();
         }
 
-        private BuiltMesh? BuildMesh(GltfDocument doc, int meshIndex, Dictionary<int, ModelMaterial> materials,
+        private BuiltMesh? BuildMesh(GltfDocument doc, int meshIndex, int skinIndex, Dictionary<int, ModelMaterial> materials,
             ModelMaterial defaultMaterial, Dictionary<ModelMaterial, int> textureSources)
         {
             if (meshIndex < 0 || meshIndex >= doc.Meshes.Count)
                 throw new InvalidDataException($"Node refers to missing glTF mesh {meshIndex}");
+
+            // A skin none of whose joints the avatar has leaves a mesh that is just a mesh
+            var skin = skinIndex >= 0 ? ReadSkin(doc, skinIndex) : null;
 
             var gltfMesh = doc.Meshes[meshIndex];
             var primitives = new List<PrimitiveData>();
@@ -320,11 +399,11 @@ namespace LibreMetaverse.ImportExport
             {
                 if (primitive.Mode != GltfPrimitiveMode.Triangles)
                 {
-                    Logger.Warn($"Skipping glTF primitive of mesh {meshIndex}: only triangle lists are supported");
+                    _diagnostics.Warn(ModelDiagnosticCode.PrimitiveSkipped, $"Skipping glTF primitive of mesh {meshIndex}: only triangle lists are supported", doc.Meshes[meshIndex].Name);
                     continue;
                 }
 
-                var data = ReadPrimitive(doc, primitive);
+                var data = ReadPrimitive(doc, primitive, skin);
                 if (data.TriangleCount == 0) continue;
 
                 data.Material = GetMaterial(doc, primitive.Material, materials, defaultMaterial, textureSources);
@@ -333,13 +412,17 @@ namespace LibreMetaverse.ImportExport
 
             if (primitives.Count == 0)
             {
-                Logger.Warn($"glTF mesh {meshIndex} has no triangles to upload");
+                _diagnostics.Warn(ModelDiagnosticCode.NoGeometry, $"glTF mesh {meshIndex} has no triangles to upload", doc.Meshes[meshIndex].Name);
                 return null;
             }
-            if (primitives.Count > 8)
+            if (primitives.Count > ModelPrim.MaxFaces)
             {
-                Logger.Warn($"glTF mesh {meshIndex} has {primitives.Count} primitives; Second Life allows 8 faces per mesh");
+                _diagnostics.Warn(ModelDiagnosticCode.TooManyFaces, $"glTF mesh {meshIndex} has {primitives.Count} primitives; Second Life allows 8 faces per mesh", doc.Meshes[meshIndex].Name, primitives.Count);
             }
+
+            // A skin lists every joint of the file's armature, which is far more than any one mesh is weighted to. The
+            // asset keeps just the ones this mesh uses, as a COLLADA controller does, and the limit applies to those.
+            var meshJoints = skin != null ? UsedJoints(skin, primitives) : null;
 
             // Fit the vertex positions of every primitive into the identity cube -0.5 .. 0.5
             var boundMin = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
@@ -356,6 +439,15 @@ namespace LibreMetaverse.ImportExport
             var result = new BuiltMesh();
             result.AssetScale = boundMax - boundMin;
             result.AssetOffset = boundMin + (result.AssetScale / 2);
+            result.Skinned = skin != null;
+
+            // The unit cube the vertices are fitted into has to be undone before the skin sees them, so the
+            // bind shape matrix carries the scale and offset (a flat axis has nothing to scale). Normals
+            // are put through its inverse transpose when drawn, so they are stored scaled the other way.
+            var fit = new Vector3(
+                result.AssetScale.X == 0 ? 1f : result.AssetScale.X,
+                result.AssetScale.Y == 0 ? 1f : result.AssetScale.Y,
+                result.AssetScale.Z == 0 ? 1f : result.AssetScale.Z);
             var template = result.Template;
             template.BoundMin = boundMin;
             template.BoundMax = boundMax;
@@ -393,10 +485,14 @@ namespace LibreMetaverse.ImportExport
 
                     foreach (var index in corners)
                     {
+                        var normal = p.Normals != null ? p.Normals[index] : flat;
+                        // Fitting the mesh into the unit cube stretches it unevenly, which the stored normals
+                        // have to allow for. A skin's bind shape is exact about the scale, so it gets that one.
+                        normal = skin != null ? SafeNormalize(normal * fit) : UnitCubeFit.FitNormal(normal, result.AssetScale);
                         var vertex = new Vertex
                         {
                             Position = normalized[index],
-                            Normal = p.Normals != null ? p.Normals[index] : flat
+                            Normal = normal
                         };
                         if (p.TexCoords != null)
                         {
@@ -404,14 +500,17 @@ namespace LibreMetaverse.ImportExport
                             var uv = p.TexCoords[index];
                             vertex.TexCoord = new Vector2(uv.X, 1f - uv.Y);
                         }
-                        face.AddVertex(vertex);
+                        if (skin != null)
+                            face.AddVertex(vertex, p.Weights![index]);
+                        else
+                            face.AddVertex(vertex);
                     }
                 }
 
                 if (face.Vertices.Count > MaxFaceVertices)
                 {
-                    Logger.Warn($"Skipping a glTF primitive of mesh {meshIndex}: it has {face.Vertices.Count} " +
-                                $"distinct vertices, and a face holds at most {MaxFaceVertices}");
+                    _diagnostics.Warn(ModelDiagnosticCode.FaceSkipped, $"Skipping a glTF primitive of mesh {meshIndex}: it has {face.Vertices.Count} " +
+                                $"distinct vertices, and a face holds at most {MaxFaceVertices}", doc.Meshes[meshIndex].Name);
                     continue;
                 }
                 template.Faces.Add(face);
@@ -419,11 +518,26 @@ namespace LibreMetaverse.ImportExport
 
             if (template.Faces.Count == 0) return null;
 
+            if (skin != null)
+            {
+                var bind = Matrix4.CreateScale(fit) * Matrix4.CreateTranslation(result.AssetOffset);
+                template.Skin = new ModelSkin
+                {
+                    JointNames = meshJoints!.Names,
+                    InverseBindMatrices = meshJoints.InverseBind,
+                    BindShapeMatrix = new[]
+                    {
+                        bind.M11, bind.M12, bind.M13, bind.M14, bind.M21, bind.M22, bind.M23, bind.M24,
+                        bind.M31, bind.M32, bind.M33, bind.M34, bind.M41, bind.M42, bind.M43, bind.M44
+                    }
+                };
+            }
+
             template.CreateAsset(UUID.Zero);
             return result;
         }
 
-        private PrimitiveData ReadPrimitive(GltfDocument doc, GltfPrimitive primitive)
+        private PrimitiveData ReadPrimitive(GltfDocument doc, GltfPrimitive primitive, SkinInfo? skin)
         {
             if (!primitive.Attributes.TryGetValue(GltfPrimitive.ATTR_POSITION, out var posAccessor))
                 throw new InvalidDataException("glTF primitive has no POSITION attribute");
@@ -441,7 +555,7 @@ namespace LibreMetaverse.ImportExport
             {
                 if (!positions[i].IsFinite())
                     throw new InvalidDataException("glTF POSITION data contains a value that is not a number");
-                data.Positions[i] = Vector3.Transform(positions[i], YUpToZUp);
+                data.Positions[i] = Vector3.Transform(positions[i], skin != null ? skin.MeshToSl : YUpToZUp);
             }
 
             if (primitive.Attributes.TryGetValue(GltfPrimitive.ATTR_NORMAL, out var norAccessor))
@@ -455,7 +569,7 @@ namespace LibreMetaverse.ImportExport
                 data.Normals = new Vector3[vertexCount];
                 for (int i = 0; i < vertexCount; i++)
                 {
-                    data.Normals[i] = SafeNormalize(Vector3.TransformNormal(normals[i], YUpToZUp));
+                    data.Normals[i] = SafeNormalize(Vector3.TransformNormal(normals[i], skin != null ? skin.NormalToSl : YUpToZUp));
                 }
             }
 
@@ -486,8 +600,326 @@ namespace LibreMetaverse.ImportExport
             }
 
             data.TriangleCount = indexCount / 3;
+            if (skin != null) data.Weights = ReadWeights(doc, primitive, vertexCount, skin);
             return data;
         }
+
+        #region Skins
+
+        private sealed class SkinInfo
+        {
+            /// <summary>Avatar joint names, each once, in the order the weights index them</summary>
+            public List<string> Names = new List<string>();
+
+            /// <summary>For each joint of the glTF skin, its index in <see cref="Names"/>, or -1 if the avatar has no such joint</summary>
+            public int[] Map = Array.Empty<int>();
+
+            /// <summary>One inverse bind matrix per entry of <see cref="Names"/>: 16 floats, row-major, row vector, in Second Life's axes</summary>
+            public float[] InverseBind = Array.Empty<float>();
+
+            /// <summary>Takes the mesh's vertices to Second Life's axes, as the bind shape sees them</summary>
+            public Matrix4 MeshToSl = Matrix4.Identity;
+
+            /// <summary>Takes the mesh's normals to Second Life's axes (the inverse transpose of <see cref="MeshToSl"/>)</summary>
+            public Matrix4 NormalToSl = Matrix4.Identity;
+        }
+
+        /// <returns>The skin, or null if none of its joints are joints of the avatar</returns>
+        private SkinInfo? ReadSkin(GltfDocument doc, int index)
+        {
+            if (_skins.TryGetValue(index, out var cached)) return cached;
+            if (index < 0 || index >= doc.Skins.Count)
+                throw new InvalidDataException($"Node refers to missing glTF skin {index}");
+
+            var skin = doc.Skins[index];
+            int count = skin.Joints.Count;
+            if (count == 0)
+                throw new InvalidDataException("glTF skin has no joints");
+            _vertexBudget -= count;
+            if (_vertexBudget < 0)
+                throw new LimitExceededException($"glTF model is larger than the {MaxVertices} vertices allowed");
+
+            // Without matrices every joint's is the identity
+            float[]? matrices = null;
+            if (skin.InverseBindMatrices >= 0)
+            {
+                int available = CheckAccessor(doc, skin.InverseBindMatrices, GltfAccessorType.Mat4, "inverse bind matrix",
+                    c => c == GltfComponentType.Float, false);
+                if (available < count)
+                    throw new InvalidDataException("glTF skin has fewer inverse bind matrices than joints");
+                matrices = ReadMatrices(doc, skin.InverseBindMatrices, count);
+            }
+
+            var avatar = AvatarSkeletonIndex.Default;
+            if (avatar == null)
+                _diagnostics.Warn(ModelDiagnosticCode.SkeletonUnavailable, "The avatar skeleton is not available, so joint names are not checked");
+
+            var jointNames = new List<string>(count);
+            for (int j = 0; j < count; j++)
+            {
+                int node = skin.Joints[j];
+                if (node < 0 || node >= doc.Nodes.Count)
+                    throw new InvalidDataException($"glTF skin refers to missing joint node {node}");
+                jointNames.Add(doc.Nodes[node].Name ?? string.Empty);
+            }
+
+            var selection = RigImport.SelectJoints(jointNames, avatar);
+            var info = new SkinInfo { Map = selection.Map, Names = selection.Names };
+            var firstOf = selection.FirstOf; // the glTF joint each avatar joint was taken from
+
+            if (selection.Dropped.Count > 0)
+                _diagnostics.Warn(ModelDiagnosticCode.JointsIgnored, $"Ignoring glTF joints that are not on the avatar skeleton: {string.Join(", ", selection.Dropped)}", string.Join(", ", selection.Dropped), selection.Dropped.Count);
+
+            if (info.Names.Count == 0)
+            {
+                _diagnostics.Warn(ModelDiagnosticCode.RigDropped, "None of the joints of the glTF skin are on the avatar skeleton, so the mesh is loaded without a rig");
+                _skins[index] = null;
+                return null;
+            }
+            // glTF's matrices are column vector and Second Life's row vector, which for these 16 floats in file order
+            // is no more than reading them as rows
+            Func<int, NumMatrix> fileMatrix = j => matrices == null
+                ? NumMatrix.Identity
+                : new NumMatrix(
+                    matrices[j * 16], matrices[j * 16 + 1], matrices[j * 16 + 2], matrices[j * 16 + 3],
+                    matrices[j * 16 + 4], matrices[j * 16 + 5], matrices[j * 16 + 6], matrices[j * 16 + 7],
+                    matrices[j * 16 + 8], matrices[j * 16 + 9], matrices[j * 16 + 10], matrices[j * 16 + 11],
+                    matrices[j * 16 + 12], matrices[j * 16 + 13], matrices[j * 16 + 14], matrices[j * 16 + 15]);
+
+            var result = new List<NumMatrix>();
+            if (!UseAvatarJointAxes || !TryAlignToAvatar(doc, skin, firstOf, fileMatrix, info, result))
+            {
+                // As authored. The file's axes are Y-up where the vertices are turned into Z-up, so each matrix
+                // is conjugated by the same turn
+                info.MeshToSl = YUpToZUp;
+                info.NormalToSl = YUpToZUp;
+                result.Clear();
+                foreach (var j in firstOf)
+                {
+                    result.Add(ToNumerics(ZUpToYUp * ToLibre(fileMatrix(j)) * YUpToZUp));
+                }
+            }
+
+            info.InverseBind = RigImport.Flatten(result, "glTF skin");
+            _skins[index] = info;
+            return info;
+        }
+
+        private static NumMatrix ToNumerics(Matrix4 m) => new NumMatrix(
+            m.M11, m.M12, m.M13, m.M14, m.M21, m.M22, m.M23, m.M24,
+            m.M31, m.M32, m.M33, m.M34, m.M41, m.M42, m.M43, m.M44);
+
+        private static Matrix4 ToLibre(NumMatrix m) => new Matrix4(
+            m.M11, m.M12, m.M13, m.M14, m.M21, m.M22, m.M23, m.M24,
+            m.M31, m.M32, m.M33, m.M34, m.M41, m.M42, m.M43, m.M44);
+
+        /// <summary>The joints and inverse bind matrices of a skin that a mesh actually uses</summary>
+        private sealed class MeshJoints
+        {
+            public List<string> Names = new List<string>();
+            public float[] InverseBind = Array.Empty<float>();
+        }
+
+        /// <summary>
+        /// Narrows <paramref name="skin"/> to the joints that carry weight on <paramref name="primitives"/>, in the skin's
+        /// order, and renumbers the weights to match.
+        /// </summary>
+        /// <exception cref="LimitExceededException">The mesh uses more than <see cref="MaxJoints"/> joints</exception>
+        private MeshJoints UsedJoints(SkinInfo skin, List<PrimitiveData> primitives)
+        {
+            var used = new bool[skin.Names.Count];
+            foreach (var p in primitives)
+            {
+                foreach (var w in p.Weights!)
+                {
+                    if (w.Weight0 > 0f) used[w.Joint0] = true;
+                    if (w.Weight1 > 0f) used[w.Joint1] = true;
+                    if (w.Weight2 > 0f) used[w.Joint2] = true;
+                    if (w.Weight3 > 0f) used[w.Joint3] = true;
+                }
+            }
+
+            var remap = new int[used.Length];
+            var result = new MeshJoints();
+            var matrices = new List<float>();
+            for (int i = 0; i < used.Length; i++)
+            {
+                if (!used[i]) continue;
+                remap[i] = result.Names.Count;
+                result.Names.Add(skin.Names[i]);
+                for (int k = 0; k < 16; k++) matrices.Add(skin.InverseBind[i * 16 + k]);
+            }
+            if (result.Names.Count > MaxJoints)
+                throw new LimitExceededException($"glTF mesh is weighted to {result.Names.Count} joints, and a mesh may use at most {MaxJoints}");
+            result.InverseBind = matrices.ToArray();
+
+            foreach (var p in primitives)
+            {
+                for (int v = 0; v < p.Weights!.Length; v++)
+                {
+                    var w = p.Weights[v];
+                    w.Joint0 = w.Weight0 > 0f ? remap[w.Joint0] : 0;
+                    w.Joint1 = w.Weight1 > 0f ? remap[w.Joint1] : 0;
+                    w.Joint2 = w.Weight2 > 0f ? remap[w.Joint2] : 0;
+                    w.Joint3 = w.Weight3 > 0f ? remap[w.Joint3] : 0;
+                    p.Weights[v] = w;
+                }
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Rebuilds the inverse bind matrices with the avatar's own joint axes: each joint keeps the position the file
+        /// puts it at, and has the rotation and scale the avatar's joint has there. Everything the file's axes did to the mesh is moved into where the mesh
+        /// itself sits, so the mesh looks the same at rest. See <see cref="UseAvatarJointAxes"/>.
+        /// </summary>
+        /// <returns>False if it cannot be done, and the matrices should be used as they are</returns>
+        private bool TryAlignToAvatar(GltfDocument doc, GltfSkin skin, List<int> joints, Func<int, NumMatrix> fileMatrix,
+            SkinInfo info, List<NumMatrix> result)
+        {
+            // M takes the mesh as it is in the file to where the file's scene puts it at rest
+            var worlds = new List<NumMatrix>();
+            var bound = new List<NumMatrix>();
+            foreach (var j in joints)
+            {
+                var world = ToNumerics(NodeWorld(doc, skin.Joints[j]));
+                worlds.Add(world);
+                bound.Add(fileMatrix(j) * world);
+            }
+
+            if (!NumMatrix.Invert(bound[0], out var inverseReference))
+            {
+                _diagnostics.Warn(ModelDiagnosticCode.RigApproximated, "The glTF skin puts its mesh through a matrix that cannot be inverted, so its inverse bind matrices are used as authored");
+                return false;
+            }
+
+            var toSl = ToNumerics(YUpToZUp);
+            var fromSl = ToNumerics(ZUpToYUp);
+            var meshToSl = bound[0] * toSl;
+            if (!NumMatrix.Invert(meshToSl, out var inverseMeshToSl))
+                return false;
+
+            info.MeshToSl = ToLibre(meshToSl);
+            info.NormalToSl = ToLibre(NumMatrix.Transpose(inverseMeshToSl));
+
+            for (int i = 0; i < joints.Count; i++)
+            {
+                // The joint's position from the file, with the avatar's own axes and size at that joint
+                var origin = NumVector3.Transform(new NumVector3(worlds[i].M41, worlds[i].M42, worlds[i].M43), toSl);
+                var inverseAvatarWorld = RigImport.OnAvatarAxes(info.Names[i], NumMatrix.CreateTranslation(origin), out bool invertible);
+                if (!invertible)
+                    return false;
+
+                result.Add(fromSl * inverseReference * bound[i] * toSl * inverseAvatarWorld);
+            }
+            return true;
+        }
+
+        /// <summary>A node's transform in the scene, from its own and its parents' (row vector, glTF's axes)</summary>
+        private Matrix4 NodeWorld(GltfDocument doc, int node)
+        {
+            if (_nodeParents == null)
+            {
+                _nodeParents = new int[doc.Nodes.Count];
+                for (int i = 0; i < _nodeParents.Length; i++) _nodeParents[i] = -1;
+                for (int i = 0; i < doc.Nodes.Count; i++)
+                {
+                    foreach (var child in doc.Nodes[i].Children)
+                    {
+                        if (child >= 0 && child < _nodeParents.Length) _nodeParents[child] = i;
+                    }
+                }
+            }
+
+            var world = LocalTransform(doc.Nodes[node]);
+            int steps = 0;
+            for (int parent = _nodeParents[node]; parent >= 0; parent = _nodeParents[parent])
+            {
+                // A node cannot be its own ancestor
+                if (++steps > doc.Nodes.Count)
+                    throw new InvalidDataException("glTF nodes form a loop");
+                world = world * LocalTransform(doc.Nodes[parent]);
+            }
+            return world;
+        }
+
+        /// <summary>Reads <paramref name="count"/> MAT4 elements whose accessor has been through <see cref="CheckAccessor"/></summary>
+        private static float[] ReadMatrices(GltfDocument doc, int accessorIndex, int count)
+        {
+            var accessor = doc.Accessors[accessorIndex];
+            var view = doc.BufferViews[accessor.BufferView];
+            var buffer = doc.Buffers[view.Buffer].Data!;
+            long stride = view.ByteStride > 0 ? view.ByteStride : accessor.DefaultStride;
+            long start = (long)view.ByteOffset + accessor.ByteOffset;
+
+            var result = new float[count * 16];
+            for (int i = 0; i < count; i++)
+            {
+                for (int k = 0; k < 16; k++)
+                {
+                    float value = BitConverter.ToSingle(buffer, (int)(start + i * stride + k * 4));
+                    if (!Utils.IsFinite(value))
+                        throw new InvalidDataException("glTF inverse bind matrix contains a value that is not a number");
+                    result[i * 16 + k] = value;
+                }
+            }
+            return result;
+        }
+
+        private VertexWeight[] ReadWeights(GltfDocument doc, GltfPrimitive primitive, int vertexCount, SkinInfo skin)
+        {
+            if (!primitive.Attributes.TryGetValue(GltfPrimitive.ATTR_JOINTS_0, out var jointsAccessor) ||
+                !primitive.Attributes.TryGetValue(GltfPrimitive.ATTR_WEIGHTS_0, out var weightsAccessor))
+                throw new InvalidDataException("glTF primitive of a skinned mesh has no JOINTS_0 and WEIGHTS_0");
+
+            if (primitive.Attributes.ContainsKey("JOINTS_1"))
+                _diagnostics.Warn(ModelDiagnosticCode.InfluencesIgnored, "Ignoring glTF influences beyond the first four of each vertex: Second Life takes four");
+
+            int jointCount = CheckAccessor(doc, jointsAccessor, GltfAccessorType.Vec4, "JOINTS_0",
+                c => c == GltfComponentType.UnsignedByte || c == GltfComponentType.UnsignedShort, false);
+            int weightCount = CheckAccessor(doc, weightsAccessor, GltfAccessorType.Vec4, "WEIGHTS_0",
+                c => c == GltfComponentType.Float, true);
+            if (jointCount != vertexCount || weightCount != vertexCount)
+                throw new InvalidDataException("glTF JOINTS_0, WEIGHTS_0 and POSITION counts differ");
+
+            var joints = doc.GetJoints(primitive);
+            var weights = doc.GetWeights(primitive);
+            var result = new VertexWeight[vertexCount];
+            var influences = new List<KeyValuePair<int, float>>(4);
+            int unweighted = 0;
+
+            for (int v = 0; v < vertexCount; v++)
+            {
+                influences.Clear();
+                int[] j = { joints[v].j0, joints[v].j1, joints[v].j2, joints[v].j3 };
+                float[] w = { weights[v].X, weights[v].Y, weights[v].Z, weights[v].W };
+
+                for (int k = 0; k < 4; k++)
+                {
+                    if (!Utils.IsFinite(w[k]) || w[k] < 0f)
+                        throw new InvalidDataException("glTF WEIGHTS_0 contains a value that is not a weight");
+                    if (w[k] == 0f) continue;
+                    if (j[k] >= skin.Map.Length)
+                        throw new InvalidDataException("glTF JOINTS_0 refers to a joint the skin does not have");
+
+                    int joint = skin.Map[j[k]];
+                    if (joint < 0) continue;
+
+                    influences.Add(new KeyValuePair<int, float>(joint, w[k]));
+                }
+
+                // Strongest first, and they add up to one. Nothing it is weighted to being a joint of the avatar
+                // leaves a vertex that follows the first one.
+                if (!RigImport.Reduce(influences, out var weight)) unweighted++;
+                result[v] = weight;
+            }
+
+            if (unweighted > 0)
+                _diagnostics.Warn(ModelDiagnosticCode.UnweightedVertices, $"{unweighted} vertices have no weight to a joint of the avatar and follow the first joint instead", null, unweighted);
+            return result;
+        }
+
+        #endregion Skins
 
         private static Vector3 SafeNormalize(Vector3 v)
         {
@@ -520,7 +952,7 @@ namespace LibreMetaverse.ImportExport
             if (accessor.Count < 0)
                 throw new InvalidDataException($"glTF {what} accessor has a negative count");
             if (accessor.Count > _vertexBudget)
-                throw new InvalidDataException($"glTF model is larger than the {MaxVertices} vertices allowed");
+                throw new LimitExceededException($"glTF model is larger than the {MaxVertices} vertices allowed");
             _vertexBudget -= accessor.Count;
 
             if (accessor.BufferView < 0 || accessor.BufferView >= doc.BufferViews.Count)
@@ -578,7 +1010,7 @@ namespace LibreMetaverse.ImportExport
                 if (textureIndex >= doc.Textures.Count ||
                     doc.Textures[textureIndex].Source < 0 || doc.Textures[textureIndex].Source >= doc.Images.Count)
                 {
-                    Logger.Warn($"glTF material {material.ID} refers to a missing texture");
+                    _diagnostics.Warn(ModelDiagnosticCode.TextureNotLoaded, $"glTF material {material.ID} refers to a missing texture", material.ID);
                 }
                 else
                 {
@@ -596,14 +1028,137 @@ namespace LibreMetaverse.ImportExport
                     }
                     catch (InvalidDataException ex)
                     {
-                        Logger.Warn($"Not loading texture for glTF material {material.ID}: {ex.Message}");
+                        _diagnostics.Warn(ModelDiagnosticCode.TextureNotLoaded, $"Not loading texture for glTF material {material.ID}: {ex.Message}", material.ID);
                     }
                 }
             }
 
+            material.Pbr = BuildPbr(doc, source, material);
+
             materials[index] = material;
             return material;
         }
+
+        #region Physically based materials
+
+        /// <summary>A material's PBR textures, and which images of the file they come from</summary>
+        private sealed class PbrSource
+        {
+            public ModelMaterial Material = null!;
+            public ModelPbrMaterial Pbr = null!;
+            public int BaseImage = -1, NormalImage = -1, MetallicRoughnessImage = -1, EmissiveImage = -1, OcclusionImage = -1;
+            public int MetallicRoughnessTexture = -1, OcclusionTexture = -1;
+        }
+
+        private List<PbrSource> _pbrSources = new List<PbrSource>();
+
+        private ModelPbrMaterial BuildPbr(GltfDocument doc, GltfDocumentMaterial source, ModelMaterial material)
+        {
+            var pbr = new ModelPbrMaterial
+            {
+                Name = material.ID,
+                BaseColorFactor = source.BaseColorFactor,
+                MetallicFactor = source.MetallicFactor,
+                RoughnessFactor = source.RoughnessFactor,
+                EmissiveFactor = source.EmissiveFactor,
+                AlphaMode = source.AlphaMode,
+                AlphaCutoff = source.AlphaCutoff,
+                DoubleSided = source.DoubleSided,
+                NormalScale = source.NormalTexture?.Scale ?? 1f,
+                OcclusionStrength = source.OcclusionTexture?.Strength ?? 1f
+            };
+
+            var record = new PbrSource { Material = material, Pbr = pbr };
+            pbr.BaseColorTexture = PbrTexture(doc, source.BaseColorTexture, material, "base color", out record.BaseImage, out _);
+            pbr.NormalTexture = PbrTexture(doc, source.NormalTexture, material, "normal", out record.NormalImage, out _);
+            pbr.MetallicRoughnessTexture = PbrTexture(doc, source.MetallicRoughnessTexture, material, "metallic-roughness",
+                out record.MetallicRoughnessImage, out record.MetallicRoughnessTexture);
+            pbr.EmissiveTexture = PbrTexture(doc, source.EmissiveTexture, material, "emissive", out record.EmissiveImage, out _);
+
+            // Occlusion has no texture of its own in a Second Life material: it is packed into the red channel of
+            // the metallic-roughness texture, so it is only an image to load from
+            PbrTexture(doc, source.OcclusionTexture, material, "occlusion", out record.OcclusionImage, out record.OcclusionTexture);
+
+            if (LoadPbrTextures)
+            {
+                // What the viewer does not use of the material, and a Second Life material cannot hold
+                var loss = new List<string>();
+                foreach (var texture in new GltfTextureRef?[] { source.BaseColorTexture, source.NormalTexture, source.MetallicRoughnessTexture,
+                             source.EmissiveTexture, source.OcclusionTexture })
+                {
+                    if (texture != null && texture.Index >= 0 && texture.TexCoord != 0) loss.Add($"a texture uses coordinate set {texture.TexCoord}");
+                }
+                if (source.NormalTexture != null && source.NormalTexture.Index >= 0 && source.NormalTexture.Scale != 1f)
+                    loss.Add("the normal map has a scale");
+                if (source.OcclusionTexture != null && source.OcclusionTexture.Index >= 0 && source.OcclusionTexture.Strength != 1f)
+                    loss.Add("occlusion has a strength");
+
+                if (loss.Count > 0)
+                {
+                    _diagnostics.Warn(ModelDiagnosticCode.PbrApproximated,
+                        $"glTF material {material.ID} has what a Second Life material cannot hold ({string.Join(", ", loss)})", material.ID, loss.Count);
+                }
+            }
+
+            _pbrSources.Add(record);
+            return pbr;
+        }
+
+        /// <summary>The texture of a material slot, or null if it has none or its image cannot be found</summary>
+        private ModelTexture? PbrTexture(GltfDocument doc, GltfTextureRef? reference, ModelMaterial material, string slot,
+            out int imageIndex, out int textureIndex)
+        {
+            imageIndex = -1;
+            textureIndex = reference?.Index ?? -1;
+            if (reference == null || reference.Index < 0) return null;
+
+            if (reference.Index >= doc.Textures.Count || doc.Textures[reference.Index].Source < 0 ||
+                doc.Textures[reference.Index].Source >= doc.Images.Count)
+            {
+                if (LoadPbrTextures)
+                    _diagnostics.Warn(ModelDiagnosticCode.TextureNotLoaded, $"glTF material {material.ID} refers to a missing {slot} texture", material.ID);
+                return null;
+            }
+
+            int index = doc.Textures[reference.Index].Source;
+            var image = doc.Images[index];
+            try
+            {
+                var texture = new ModelTexture
+                {
+                    Name = image.Uri != null && !image.Uri.StartsWith("data:", StringComparison.Ordinal)
+                        ? DecodeUri(image.Uri)
+                        : "gltf-image-" + index,
+                    TexCoord = reference.TexCoord,
+                    Transform = reference.Transform
+                };
+                imageIndex = index;
+                return texture;
+            }
+            catch (InvalidDataException ex)
+            {
+                if (LoadPbrTextures)
+                    _diagnostics.Warn(ModelDiagnosticCode.TextureNotLoaded, $"Not loading {slot} texture for glTF material {material.ID}: {ex.Message}", material.ID);
+                return null;
+            }
+        }
+
+        private void WarnAboutMaterialExtensions(GltfDocument doc)
+        {
+            var used = new List<string>();
+            foreach (var name in doc.ExtensionsUsed)
+            {
+                if (name.StartsWith("KHR_materials_", StringComparison.Ordinal)) used.Add(name);
+            }
+            if (used.Count > 0)
+            {
+                _diagnostics.Warn(ModelDiagnosticCode.PbrApproximated,
+                    $"The glTF file uses material extensions a Second Life material cannot hold: {string.Join(", ", used)}",
+                    string.Join(", ", used), used.Count);
+            }
+        }
+
+        #endregion Physically based materials
 
         private void LoadImages(GltfDocument doc, Dictionary<ModelMaterial, int> textureSources)
         {
@@ -628,44 +1183,217 @@ namespace LibreMetaverse.ImportExport
             }
         }
 
+        /// <summary>Where an image of the file is: in a file beside it, or in bytes the file holds</summary>
+        private struct ImageSource
+        {
+            public string? File;       // the path, when it is a file
+            public string Relative;    // the name the file is given in the model
+            public byte[]? Bytes;      // the contents, when they are in the model
+            public string Extension;   // of the format, for bytes
+        }
+
+        /// <summary>
+        /// Finds an image, refusing a file outside the model's directory or too big to read. This is where every
+        /// texture the file names is vetted, whatever it is for.
+        /// </summary>
+        /// <returns>False if it was refused (and the reason is reported)</returns>
+        private bool TryFindImage(GltfDocument doc, GltfImage image, out ImageSource source)
+        {
+            source = new ImageSource { Relative = string.Empty, Extension = string.Empty };
+            if (image.Uri != null && !image.Uri.StartsWith("data:", StringComparison.Ordinal))
+            {
+                var relative = DecodeUri(image.Uri);
+                var fname = Path.Combine(Path.GetDirectoryName(_fileName) ?? string.Empty, relative);
+
+                if (RestrictTexturesToModelDirectory && !ModelTextureLoader.IsInModelDirectory(_fileName, fname))
+                {
+                    _diagnostics.Warn(ModelDiagnosticCode.TextureOutsideModelDirectory, $"Not loading texture {relative}: it is outside the model's directory " +
+                                "(see GltfLoader.RestrictTexturesToModelDirectory)", relative);
+                    return false;
+                }
+
+                CheckFileSize(fname);
+                source.File = fname;
+                source.Relative = relative;
+                return true;
+            }
+
+            string extension = ExtensionForMimeType(image.MimeType);
+            if (image.Uri != null)
+            {
+                source.Bytes = DecodeDataUri(image.Uri, out var mimeType);
+                if (image.MimeType == null) extension = ExtensionForMimeType(mimeType);
+            }
+            else
+            {
+                source.Bytes = ReadBufferView(doc, image.BufferView);
+            }
+            source.Extension = extension;
+            return true;
+        }
+
         private void LoadImage(GltfDocument doc, GltfImage image, ModelMaterial material)
         {
             try
             {
-                if (image.Uri != null && !image.Uri.StartsWith("data:", StringComparison.Ordinal))
-                {
-                    var relative = DecodeUri(image.Uri);
-                    var fname = Path.Combine(Path.GetDirectoryName(_fileName) ?? string.Empty, relative);
+                if (!TryFindImage(doc, image, out var source)) return;
 
-                    if (RestrictTexturesToModelDirectory && !ModelTextureLoader.IsInModelDirectory(_fileName, fname))
-                    {
-                        Logger.Warn($"Not loading texture {relative}: it is outside the model's directory " +
-                                    "(see GltfLoader.RestrictTexturesToModelDirectory)");
-                        return;
-                    }
-
-                    CheckFileSize(fname);
-                    ModelTextureLoader.LoadFile(fname, relative, material, _textureCodec);
-                    return;
-                }
-
-                byte[] bytes;
-                string extension = ExtensionForMimeType(image.MimeType);
-                if (image.Uri != null)
-                {
-                    bytes = DecodeDataUri(image.Uri, out var mimeType);
-                    if (image.MimeType == null) extension = ExtensionForMimeType(mimeType);
-                }
+                if (source.File != null)
+                    ModelTextureLoader.LoadFile(_diagnostics, source.File, source.Relative, material, _textureCodec);
                 else
-                {
-                    bytes = ReadBufferView(doc, image.BufferView);
-                }
-
-                ModelTextureLoader.LoadBytes(bytes, extension, material.Texture, material, _textureCodec);
+                    ModelTextureLoader.LoadBytes(_diagnostics, source.Bytes!, source.Extension, material.Texture, material, _textureCodec);
             }
             catch (Exception ex)
             {
-                Logger.Warn($"Failed loading glTF image {material.Texture}: {ex.Message}");
+                _diagnostics.Warn(ModelDiagnosticCode.TextureNotLoaded, $"Failed loading glTF image {material.Texture}: {ex.Message}", material.Texture);
+            }
+        }
+
+        /// <summary>Decodes an image of the file, or reports why not and returns null</summary>
+        private ManagedImage? DecodeImage(GltfDocument doc, int imageIndex, string name)
+        {
+            try
+            {
+                if (!TryFindImage(doc, doc.Images[imageIndex], out var source)) return null;
+
+                return source.File != null
+                    ? ModelTextureLoader.DecodeFile(source.File, source.Relative, _textureCodec)
+                    : ModelTextureLoader.DecodeBytes(source.Bytes!, source.Extension, name, _textureCodec);
+            }
+            catch (Exception ex)
+            {
+                _diagnostics.Warn(ModelDiagnosticCode.TextureNotLoaded, $"Failed loading glTF image {name}: {ex.Message}", name);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Prepares the textures of the materials as the viewer prepares a glTF material's when it imports one. Each
+        /// image is decoded once however many slots and materials use it, and the same result is shared.
+        /// </summary>
+        private void LoadPbrImages(GltfDocument doc)
+        {
+            var decoded = new Dictionary<int, ManagedImage?>();
+            var made = new Dictionary<string, ModelTexture?>(StringComparer.Ordinal);
+
+            ManagedImage? Decoded(int imageIndex)
+            {
+                if (!decoded.TryGetValue(imageIndex, out var image))
+                {
+                    var name = doc.Images[imageIndex].Uri ?? "gltf-image-" + imageIndex;
+                    image = DecodeImage(doc, imageIndex, name);
+                    decoded[imageIndex] = image;
+                }
+                return image;
+            }
+
+            // A copy to change, without its alpha: the viewer drops it from all but the base color
+            ManagedImage? Copy(int imageIndex)
+            {
+                var image = Decoded(imageIndex)?.Clone();
+                if (image != null && (image.Channels & ManagedImage.ImageChannels.Alpha) != 0)
+                    image.ConvertChannels(image.Channels & ~ManagedImage.ImageChannels.Alpha);
+                return image;
+            }
+
+            ModelTexture? Make(string key, Func<ManagedImage?> prepare, bool lossless)
+            {
+                if (made.TryGetValue(key, out var done)) return done;
+
+                ModelTexture? result = null;
+                var image = prepare();
+                if (image != null)
+                {
+                    try
+                    {
+                        ModelTextureLoader.Encode(image, lossless, out var data, out var width, out var height);
+                        result = new ModelTexture { Data = data, Width = width, Height = height };
+                    }
+                    catch (Exception ex)
+                    {
+                        _diagnostics.Warn(ModelDiagnosticCode.TextureNotLoaded, $"Failed encoding a glTF material texture: {ex.Message}", key);
+                    }
+                }
+                made[key] = result;
+                return result;
+            }
+
+            void Fill(ModelTexture? slot, ModelTexture? from)
+            {
+                if (slot == null || from == null) return;
+                slot.Data = from.Data;
+                slot.Width = from.Width;
+                slot.Height = from.Height;
+            }
+
+            foreach (var record in _pbrSources)
+            {
+                var pbr = record.Pbr;
+
+                // The base color is the one the mesh uses, so it is not made twice
+                if (pbr.BaseColorTexture != null && record.Material.TextureData.Length > 0)
+                {
+                    pbr.BaseColorTexture.Name = record.Material.Texture;
+                    pbr.BaseColorTexture.Data = record.Material.TextureData;
+                    pbr.BaseColorTexture.Width = record.Material.Width;
+                    pbr.BaseColorTexture.Height = record.Material.Height;
+                }
+
+                if (record.NormalImage >= 0)
+                    Fill(pbr.NormalTexture, Make("normal:" + record.NormalImage, () => Copy(record.NormalImage), lossless: true));
+                if (record.EmissiveImage >= 0)
+                    Fill(pbr.EmissiveTexture, Make("emissive:" + record.EmissiveImage, () => Copy(record.EmissiveImage), lossless: false));
+
+                // Occlusion shares the metallic-roughness texture, in its red channel
+                if (record.MetallicRoughnessImage >= 0)
+                {
+                    int mr = record.MetallicRoughnessImage;
+                    int occlusion = record.OcclusionImage;
+                    bool distinct = record.OcclusionTexture >= 0 && record.OcclusionTexture != record.MetallicRoughnessTexture && occlusion >= 0;
+                    bool none = record.OcclusionTexture < 0;
+                    string key = "mr:" + mr + (distinct ? ":occlusion:" + occlusion : none ? ":none" : ":same");
+
+                    Fill(pbr.MetallicRoughnessTexture, Make(key, () =>
+                    {
+                        var image = Copy(mr);
+                        if (image == null) return null;
+                        if (distinct)
+                        {
+                            // Scaled to the size of the metallic-roughness map, with its red channel taken
+                            var map = Copy(occlusion);
+                            if (map != null)
+                            {
+                                map.ResizeBilinear(image.Width, image.Height);
+                                image.Red = map.Red;
+                            }
+                        }
+                        else if (none)
+                        {
+                            // Nothing occludes: red has to be all white or the surface comes out black
+                            for (int i = 0; i < image.Red.Length; i++) image.Red[i] = 255;
+                        }
+                        return image;
+                    }, lossless: false));
+                }
+                else if (record.OcclusionImage >= 0)
+                {
+                    int occlusion = record.OcclusionImage;
+                    pbr.MetallicRoughnessTexture = new ModelTexture { Name = "gltf-image-" + occlusion };
+                    Fill(pbr.MetallicRoughnessTexture, Make("mr:none:occlusion:" + occlusion, () =>
+                    {
+                        // No metallic-roughness map but an occlusion map: a white one, with the occlusion in red
+                        var map = Copy(occlusion);
+                        if (map == null) return null;
+                        var image = new ManagedImage(map.Width, map.Height, ManagedImage.ImageChannels.Color);
+                        for (int i = 0; i < image.Red.Length; i++)
+                        {
+                            image.Red[i] = map.Red[i];
+                            image.Green[i] = 255;
+                            image.Blue[i] = 255;
+                        }
+                        return image;
+                    }, lossless: false));
+                }
             }
         }
 
@@ -750,7 +1478,7 @@ namespace LibreMetaverse.ImportExport
         private void CheckFileSize(string fname)
         {
             if (new FileInfo(fname).Length > MaxFileSize)
-                throw new InvalidDataException($"{fname} is larger than {MaxFileSize} bytes");
+                throw new LimitExceededException($"{fname} is larger than {MaxFileSize} bytes");
         }
 
         /// <summary>
